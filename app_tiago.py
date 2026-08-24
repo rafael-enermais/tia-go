@@ -29,7 +29,7 @@ import plotly.graph_objects as go
 
 MODEL_ID = "claude-sonnet-4-5"  # TODO confirmar antes de ir pra produção
 
-st.set_page_config(page_title="T.IA", layout="wide")
+st.set_page_config(page_title="TIA.go", layout="wide")
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo-enermais.png")
 
@@ -208,6 +208,42 @@ def consultar_previsao_por_vencimento(meses=3):
     return linhas
 
 
+def consultar_movimentos(tipo="pagamento", nome=None, meses=3):
+    # Ledger REAL (payments/receipts do Sienge, ja com data real do evento) -
+    # nao depende de historico acumulado por nos, existe desde a 1a ingestao.
+    meses = max(1, min(int(meses), 24))
+    desde = (date.today() - timedelta(days=31 * meses)).isoformat()
+    if tipo == "recebimento":
+        tabela, campo_nome = "movimentos_recebimento", "client_name"
+    else:
+        tabela, campo_nome = "movimentos_pagamento", "creditor_name"
+    q = (
+        sb.table(tabela)
+        .select(f"bill_id, installment_id, {campo_nome}, payment_date, net_amount, operation_type_name")
+        .gte("payment_date", desde)
+        .order("payment_date", desc=True)
+    )
+    if nome:
+        q = q.ilike(campo_nome, f"%{nome}%")
+    dados = q.execute().data
+    total = sum(d["net_amount"] or 0 for d in dados)
+    return {"total": total, "quantidade": len(dados), "movimentos": dados[:50]}
+
+
+def consultar_aprovacoes(fornecedor=None, dias=90):
+    dias = max(1, min(int(dias), 730))
+    desde_dt = date.today() - timedelta(days=dias)
+    q = (
+        sb.table("aprovacoes_pagar")
+        .select("bill_id, installment_id, creditor_name, authorization_user_name, authorization_date, is_last_to_authorize")
+        .gte("authorization_date", desde_dt.isoformat())
+        .order("authorization_date", desc=True)
+    )
+    if fornecedor:
+        q = q.ilike("creditor_name", f"%{fornecedor}%")
+    return q.execute().data[:50]
+
+
 TOOLS = [
     {
         "name": "consultar_totais_atuais",
@@ -260,11 +296,47 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "consultar_movimentos",
+        "description": (
+            "Ledger REAL de pagamentos ou recebimentos JÁ REALIZADOS (data real do evento, "
+            "segundo o Sienge - não depende de histórico acumulado por nós). Use pra "
+            "'quanto já pagamos/recebemos', especialmente filtrando por fornecedor/cliente "
+            "específico (parâmetro nome)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tipo": {"type": "string", "enum": ["pagamento", "recebimento"], "description": "pagamento ou recebimento (padrão pagamento)"},
+                "nome": {"type": "string", "description": "Nome (ou parte do nome) do fornecedor/cliente pra filtrar - opcional"},
+                "meses": {"type": "integer", "description": "Quantos meses pra trás olhar (padrão 3, máx 24)"},
+            },
+        },
+    },
+    {
+        "name": "consultar_aprovacoes",
+        "description": (
+            "Histórico REAL de aprovações de contas a pagar (quem aprovou, quando) - data "
+            "real do Sienge, não depende de histórico acumulado por nós."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fornecedor": {"type": "string", "description": "Nome (ou parte do nome) do fornecedor pra filtrar - opcional"},
+                "dias": {"type": "integer", "description": "Quantos dias pra trás olhar (padrão 90)"},
+            },
+        },
+    },
 ]
 
 # Ferramentas cujo resultado, além de virar texto pro chat, também é plotado
 # direto no dashboard (dash reage à conversa) - populam st.session_state.dash_extra.
-FERRAMENTAS_VISUAIS = {"consultar_maiores_vencimentos", "consultar_previsao_por_vencimento"}
+FERRAMENTAS_VISUAIS = {
+    "consultar_maiores_vencimentos",
+    "consultar_previsao_por_vencimento",
+    "consultar_movimentos",
+    "consultar_aprovacoes",
+}
 
 
 def executar_ferramenta(nome, entrada):
@@ -276,17 +348,24 @@ def executar_ferramenta(nome, entrada):
         return consultar_maiores_vencimentos(entrada.get("tipo", "pagar"), entrada.get("n", 10))
     if nome == "consultar_previsao_por_vencimento":
         return consultar_previsao_por_vencimento(entrada.get("meses", 3))
+    if nome == "consultar_movimentos":
+        return consultar_movimentos(entrada.get("tipo", "pagamento"), entrada.get("nome"), entrada.get("meses", 3))
+    if nome == "consultar_aprovacoes":
+        return consultar_aprovacoes(entrada.get("fornecedor"), entrada.get("dias", 90))
     return {"erro": "ferramenta desconhecida"}
 
 
 SYSTEM_PROMPT = (
-    "Você é a T.IA, assistente financeira da EnerMais, feita pra ajudar a Maria (gerente "
+    "Você é a TIA.go, assistente financeira da EnerMais, feita pra ajudar a Maria (gerente "
     "financeira) a acompanhar e prever o fluxo de caixa. Responda só com dados que vieram "
     "de verdade das ferramentas — nunca invente número, data ou valor. Se a ferramenta não "
     "trouxer dado suficiente pra responder, diga isso claramente em vez de estimar. Quando "
-    "usar consultar_maiores_vencimentos ou consultar_previsao_por_vencimento, o resultado "
-    "também aparece como tabela/gráfico no dashboard ao lado — pode avisar a pessoa disso "
-    "na resposta."
+    "usar consultar_maiores_vencimentos, consultar_previsao_por_vencimento, "
+    "consultar_movimentos ou consultar_aprovacoes, o resultado também aparece como "
+    "tabela/gráfico no dashboard ao lado — pode avisar a pessoa disso na resposta. "
+    "consultar_movimentos e consultar_aprovacoes usam dado REAL do Sienge (data real de "
+    "pagamento/recebimento/aprovação) — não dependem de histórico acumulado por nós, "
+    "funcionam mesmo no primeiro dia de uso."
 )
 
 
@@ -341,9 +420,26 @@ with col_dash:
                 st.plotly_chart(fig_prev, use_container_width=True)
             else:
                 st.caption("Nenhuma parcela com vencimento no período encontrada.")
+        elif extra["tool"] == "consultar_movimentos":
+            tipo = extra["input"].get("tipo", "pagamento")
+            nome = extra["input"].get("nome")
+            titulo = f"Gerado pela conversa — movimentos de {tipo}" + (f" ({nome})" if nome else "")
+            st.caption(titulo)
+            res = extra["resultado"]
+            if res["movimentos"]:
+                st.metric("Total no período", f"R$ {res['total']:,.2f}")
+                st.dataframe(pd.DataFrame(res["movimentos"]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("Nenhum movimento real encontrado no período.")
+        elif extra["tool"] == "consultar_aprovacoes":
+            st.caption("Gerado pela conversa — histórico de aprovações")
+            if extra["resultado"]:
+                st.dataframe(pd.DataFrame(extra["resultado"]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("Nenhuma aprovação encontrada no período.")
 
 with col_chat:
-    st.subheader("Pergunte à T.IA")
+    st.subheader("Pergunte à TIA.go")
     if "mensagens" not in st.session_state:
         st.session_state.mensagens = []
 
@@ -359,12 +455,18 @@ with col_chat:
                 st.markdown(m["content"] if isinstance(m["content"], str) else "(ferramenta)")
         pergunta = st.chat_input("Pergunte sobre o fluxo de caixa...")
 
+    # Padrão de 2 fases (evita o bug de ordem visto no teste real: nunca
+    # renderizar a mensagem nova "na mão" fora do loop - sempre grava no
+    # session_state e recarrega, pra o loop acima (a única fonte de verdade
+    # da ordem) desenhar tudo certo, com o chat_input sempre por último):
+    # fase 1 - só grava a pergunta e recarrega (aparece na hora, sem esperar
+    # a API); fase 2 - roda na recarga seguinte, sem pergunta nova pendente.
     if pergunta:
         st.session_state.mensagens.append({"role": "user", "content": pergunta})
-        with chat_box:
-            with st.chat_message("user"):
-                st.markdown(pergunta)
+        st.rerun()
 
+    if st.session_state.mensagens and st.session_state.mensagens[-1]["role"] == "user":
+        with st.spinner("TIA.go consultando..."):
             client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
             mensagens_api = [
                 {"role": m["role"], "content": m["content"]}
@@ -372,46 +474,37 @@ with col_chat:
                 if isinstance(m["content"], str)
             ]
 
-            with st.chat_message("assistant"):
-                with st.spinner("Consultando..."):
-                    resposta = client.messages.create(
-                        model=MODEL_ID,
-                        max_tokens=1024,
-                        system=SYSTEM_PROMPT,
-                        tools=TOOLS,
-                        messages=mensagens_api,
+            resposta = client.messages.create(
+                model=MODEL_ID,
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                tools=TOOLS,
+                messages=mensagens_api,
+            )
+
+            while resposta.stop_reason == "tool_use":
+                tool_uses = [b for b in resposta.content if b.type == "tool_use"]
+                resultados = []
+                for tu in tool_uses:
+                    resultado = executar_ferramenta(tu.name, tu.input)
+                    if tu.name in FERRAMENTAS_VISUAIS:
+                        st.session_state.dash_extra = {
+                            "tool": tu.name, "input": tu.input, "resultado": resultado
+                        }
+                    resultados.append(
+                        {"type": "tool_result", "tool_use_id": tu.id, "content": str(resultado)}
                     )
+                mensagens_api.append({"role": "assistant", "content": resposta.content})
+                mensagens_api.append({"role": "user", "content": resultados})
+                resposta = client.messages.create(
+                    model=MODEL_ID,
+                    max_tokens=1024,
+                    system=SYSTEM_PROMPT,
+                    tools=TOOLS,
+                    messages=mensagens_api,
+                )
 
-                    houve_visual = False
-                    while resposta.stop_reason == "tool_use":
-                        tool_uses = [b for b in resposta.content if b.type == "tool_use"]
-                        resultados = []
-                        for tu in tool_uses:
-                            resultado = executar_ferramenta(tu.name, tu.input)
-                            if tu.name in FERRAMENTAS_VISUAIS:
-                                st.session_state.dash_extra = {
-                                    "tool": tu.name, "input": tu.input, "resultado": resultado
-                                }
-                                houve_visual = True
-                            resultados.append(
-                                {"type": "tool_result", "tool_use_id": tu.id, "content": str(resultado)}
-                            )
-                        mensagens_api.append({"role": "assistant", "content": resposta.content})
-                        mensagens_api.append({"role": "user", "content": resultados})
-                        resposta = client.messages.create(
-                            model=MODEL_ID,
-                            max_tokens=1024,
-                            system=SYSTEM_PROMPT,
-                            tools=TOOLS,
-                            messages=mensagens_api,
-                        )
-
-                    texto_final = "".join(b.text for b in resposta.content if b.type == "text")
-                st.markdown(texto_final)
+            texto_final = "".join(b.text for b in resposta.content if b.type == "text")
 
         st.session_state.mensagens.append({"role": "assistant", "content": texto_final})
-
-        if houve_visual:
-            # Recarrega a página pra a coluna do dashboard (que já rodou antes do chat
-            # nesta mesma execução) desenhar a visualização nova que acabamos de gerar.
-            st.rerun()
+        st.rerun()
