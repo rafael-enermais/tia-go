@@ -484,7 +484,14 @@ with col_chat:
         """,
         unsafe_allow_html=True,
     )
-    chat_box = st.container(height=560, key="chat_box")
+    # Altura do chat ajustada pra acompanhar o dashboard: quando o dashboard
+    # cresce (o gráfico extra gerado pela conversa aparece do lado), o chat
+    # ficava curto e sobrava vão vazio embaixo dele (reportado por Rafael com
+    # print de tela cheia) - aqui não tem como medir a altura real do
+    # dashboard em CSS puro, então a aproximação é: mais alto quando há
+    # dash_extra, senão a altura padrão.
+    altura_chat = 900 if st.session_state.get("dash_extra") else 560
+    chat_box = st.container(height=altura_chat, key="chat_box")
     with chat_box:
         for m in st.session_state.mensagens:
             with st.chat_message(m["role"]):
