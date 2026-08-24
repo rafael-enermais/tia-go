@@ -347,60 +347,71 @@ with col_chat:
     if "mensagens" not in st.session_state:
         st.session_state.mensagens = []
 
-    for m in st.session_state.mensagens:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"] if isinstance(m["content"], str) else "(ferramenta)")
+    # Container de altura fixa: histórico rola dentro dele e o chat_input, por
+    # ser chamado DENTRO desse container, fica fixo (colado) no rodapé dele -
+    # é o comportamento nativo do Streamlit pra chat_input em container com
+    # altura definida. Sem isso o input aparecia em fluxo normal (no topo,
+    # empurrando as mensagens pra baixo) em vez de fixo embaixo.
+    chat_box = st.container(height=560)
+    with chat_box:
+        for m in st.session_state.mensagens:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"] if isinstance(m["content"], str) else "(ferramenta)")
+        pergunta = st.chat_input("Pergunte sobre o fluxo de caixa...")
 
-    pergunta = st.chat_input("Pergunte sobre o fluxo de caixa...")
     if pergunta:
         st.session_state.mensagens.append({"role": "user", "content": pergunta})
-        with st.chat_message("user"):
-            st.markdown(pergunta)
+        with chat_box:
+            with st.chat_message("user"):
+                st.markdown(pergunta)
 
-        client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
-        mensagens_api = [
-            {"role": m["role"], "content": m["content"]}
-            for m in st.session_state.mensagens
-            if isinstance(m["content"], str)
-        ]
+            client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+            mensagens_api = [
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state.mensagens
+                if isinstance(m["content"], str)
+            ]
 
-        resposta = client.messages.create(
-            model=MODEL_ID,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=mensagens_api,
-        )
+            with st.chat_message("assistant"):
+                with st.spinner("Consultando..."):
+                    resposta = client.messages.create(
+                        model=MODEL_ID,
+                        max_tokens=1024,
+                        system=SYSTEM_PROMPT,
+                        tools=TOOLS,
+                        messages=mensagens_api,
+                    )
 
-        houve_visual = False
-        while resposta.stop_reason == "tool_use":
-            tool_uses = [b for b in resposta.content if b.type == "tool_use"]
-            resultados = []
-            for tu in tool_uses:
-                resultado = executar_ferramenta(tu.name, tu.input)
-                if tu.name in FERRAMENTAS_VISUAIS:
-                    st.session_state.dash_extra = {"tool": tu.name, "input": tu.input, "resultado": resultado}
-                    houve_visual = True
-                resultados.append(
-                    {"type": "tool_result", "tool_use_id": tu.id, "content": str(resultado)}
-                )
-            mensagens_api.append({"role": "assistant", "content": resposta.content})
-            mensagens_api.append({"role": "user", "content": resultados})
-            resposta = client.messages.create(
-                model=MODEL_ID,
-                max_tokens=1024,
-                system=SYSTEM_PROMPT,
-                tools=TOOLS,
-                messages=mensagens_api,
-            )
+                    houve_visual = False
+                    while resposta.stop_reason == "tool_use":
+                        tool_uses = [b for b in resposta.content if b.type == "tool_use"]
+                        resultados = []
+                        for tu in tool_uses:
+                            resultado = executar_ferramenta(tu.name, tu.input)
+                            if tu.name in FERRAMENTAS_VISUAIS:
+                                st.session_state.dash_extra = {
+                                    "tool": tu.name, "input": tu.input, "resultado": resultado
+                                }
+                                houve_visual = True
+                            resultados.append(
+                                {"type": "tool_result", "tool_use_id": tu.id, "content": str(resultado)}
+                            )
+                        mensagens_api.append({"role": "assistant", "content": resposta.content})
+                        mensagens_api.append({"role": "user", "content": resultados})
+                        resposta = client.messages.create(
+                            model=MODEL_ID,
+                            max_tokens=1024,
+                            system=SYSTEM_PROMPT,
+                            tools=TOOLS,
+                            messages=mensagens_api,
+                        )
 
-        texto_final = "".join(b.text for b in resposta.content if b.type == "text")
+                    texto_final = "".join(b.text for b in resposta.content if b.type == "text")
+                st.markdown(texto_final)
+
         st.session_state.mensagens.append({"role": "assistant", "content": texto_final})
 
         if houve_visual:
             # Recarrega a página pra a coluna do dashboard (que já rodou antes do chat
             # nesta mesma execução) desenhar a visualização nova que acabamos de gerar.
             st.rerun()
-
-        with st.chat_message("assistant"):
-            st.markdown(texto_final)
