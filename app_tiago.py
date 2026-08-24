@@ -359,13 +359,26 @@ SYSTEM_PROMPT = (
     "Você é a TIA.go, assistente financeira da EnerMais, feita pra ajudar a Maria (gerente "
     "financeira) a acompanhar e prever o fluxo de caixa. Responda só com dados que vieram "
     "de verdade das ferramentas — nunca invente número, data ou valor. Se a ferramenta não "
-    "trouxer dado suficiente pra responder, diga isso claramente em vez de estimar. Quando "
-    "usar consultar_maiores_vencimentos, consultar_previsao_por_vencimento, "
+    "trouxer dado suficiente pra responder, diga isso claramente em vez de estimar.\n\n"
+    "Guia de qual ferramenta usar (importante, escolha pela intenção real da pergunta, não "
+    "só pela palavra 'histórico'):\n"
+    "- 'o que já foi pago/recebido', 'histórico de pagamento/recebimento', 'quanto pagamos "
+    "pro fornecedor X', 'quando recebemos do cliente Y' → consultar_movimentos. É dado REAL "
+    "do Sienge (data real do evento), funciona desde o primeiro dia, NÃO precisa de "
+    "histórico acumulado.\n"
+    "- 'quem aprovou', 'quando foi aprovado' → consultar_aprovacoes. Mesma coisa, dado real, "
+    "sem depender de acúmulo.\n"
+    "- 'quanto vai vencer', 'previsão dos próximos meses', 'projeção' → "
+    "consultar_previsao_por_vencimento. Usa a data de vencimento das parcelas já "
+    "cadastradas, também não depende de acúmulo.\n"
+    "- só use consultar_historico_diario se a pergunta for especificamente sobre a EVOLUÇÃO "
+    "DO SALDO TOTAL EM ABERTO dia a dia (ex.: 'como o saldo agregado mudou nos últimos "
+    "dias') — essa é a única métrica que realmente depende de dias reais se acumularem, "
+    "avise isso se o histórico ainda for curto, mas SEMPRE ofereça consultar_movimentos ou "
+    "consultar_previsao_por_vencimento como alternativa que já funciona.\n\n"
+    "Quando usar consultar_maiores_vencimentos, consultar_previsao_por_vencimento, "
     "consultar_movimentos ou consultar_aprovacoes, o resultado também aparece como "
-    "tabela/gráfico no dashboard ao lado — pode avisar a pessoa disso na resposta. "
-    "consultar_movimentos e consultar_aprovacoes usam dado REAL do Sienge (data real de "
-    "pagamento/recebimento/aprovação) — não dependem de histórico acumulado por nós, "
-    "funcionam mesmo no primeiro dia de uso."
+    "tabela/gráfico no dashboard ao lado — pode avisar a pessoa disso na resposta."
 )
 
 
@@ -448,7 +461,30 @@ with col_chat:
     # é o comportamento nativo do Streamlit pra chat_input em container com
     # altura definida. Sem isso o input aparecia em fluxo normal (no topo,
     # empurrando as mensagens pra baixo) em vez de fixo embaixo.
-    chat_box = st.container(height=560)
+    #
+    # CSS extra: por padrão, com poucas mensagens, elas ficam no TOPO do
+    # container e sobra um vão vazio grande até o input (que fica fixo no
+    # rodapé) - visualmente parece "flutuando". O trecho abaixo diz pro bloco
+    # de mensagens ser flex-column com justify-content:flex-end, empurrando o
+    # conteúdo pra encostar no input e crescer pra CIMA conforme a conversa
+    # cresce (como um chat comum). É CSS torcendo a estrutura interna do
+    # Streamlit (via a classe do `key="chat_box"`) - funciona nas versões
+    # atuais, mas pode precisar de ajuste se o Streamlit mudar essa estrutura
+    # numa atualização futura (avisa se o efeito parar de funcionar).
+    st.markdown(
+        """
+        <style>
+        .st-key-chat_box [data-testid="stVerticalBlock"] {
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            min-height: 100%;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    chat_box = st.container(height=560, key="chat_box")
     with chat_box:
         for m in st.session_state.mensagens:
             with st.chat_message(m["role"]):
