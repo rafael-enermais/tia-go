@@ -513,7 +513,7 @@ def gerar_relatorio_html(extra):
 * {{ box-sizing:border-box; }}
 body {{ font-family: -apple-system, "Segoe UI", Arial, sans-serif; background:#f4f5f9; color:#1a1a1a; margin:0; padding:0; }}
 .cabecalho {{ display:flex; align-items:center; gap:16px; padding:22px 32px; background:var(--navy); }}
-.cabecalho img {{ height:44px; }}
+.cabecalho img {{ height:44px; filter:brightness(0) invert(1); }}  /* mesmo truque do render_logo() da sidebar - silhueta branca, sem precisar de PNG branco separado */
 .cabecalho h1 {{ color:#fff; font-size:20px; margin:0; }}
 .cabecalho .meta {{ color:#c7c9e8; font-size:13px; margin-top:2px; }}
 .faixa {{ height:4px; background:var(--laranja); }}
