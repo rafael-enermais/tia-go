@@ -23,12 +23,9 @@ from datetime import date, timedelta
 
 import streamlit as st
 from supabase import create_client
-from streamlit_float import float_init, float_css_helper
 import anthropic
 import pandas as pd
 import plotly.graph_objects as go
-
-float_init()
 
 MODEL_ID = "claude-sonnet-4-5"  # TODO confirmar antes de ir pra produção
 
@@ -248,24 +245,36 @@ def consultar_previsao_por_vencimento(meses=3):
     return linhas
 
 
-def consultar_movimentos(tipo="pagamento", nome=None, meses=3):
+def consultar_movimentos(tipo="pagamento", nome=None, meses=3, data=None):
     # Ledger REAL (payments/receipts do Sienge, ja com data real do evento) -
     # nao depende de historico acumulado por nos, existe desde a 1a ingestao.
-    meses = max(1, min(int(meses), 24))
-    desde = (date.today() - timedelta(days=31 * meses)).isoformat()
+    # `data` (YYYY-MM-DD, opcional) filtra um dia especifico e ignora `meses`
+    # nesse caso - pedido explicito do Rafael (paridade com "buscar por dia"
+    # que ja existia no bot MarIA/Enerpix original).
     if tipo == "recebimento":
         tabela, campo_nome = "movimentos_recebimento", "client_name"
     else:
         tabela, campo_nome = "movimentos_pagamento", "creditor_name"
+
+    if data:
+        inicio = data
+        fim = (date.fromisoformat(data) + timedelta(days=1)).isoformat()
+    else:
+        meses = max(1, min(int(meses), 24))
+        inicio = (date.today() - timedelta(days=31 * meses)).isoformat()
+        fim = None
+
     def montar_query(s, e):
         q = (
             sb.table(tabela)
             .select(f"id, bill_id, installment_id, {campo_nome}, payment_date, net_amount, operation_type_name")
-            .gte("payment_date", desde)
+            .gte("payment_date", inicio)
             .order("payment_date", desc=True)
             .order("id")
             .range(s, e)
         )
+        if fim:
+            q = q.lt("payment_date", fim)
         if nome:
             q = q.ilike(campo_nome, f"%{nome}%")
         return q
@@ -359,7 +368,8 @@ TOOLS = [
             "properties": {
                 "tipo": {"type": "string", "enum": ["pagamento", "recebimento"], "description": "pagamento ou recebimento (padrão pagamento)"},
                 "nome": {"type": "string", "description": "Nome (ou parte do nome) do fornecedor/cliente pra filtrar - opcional"},
-                "meses": {"type": "integer", "description": "Quantos meses pra trás olhar (padrão 3, máx 24)"},
+                "meses": {"type": "integer", "description": "Quantos meses pra trás olhar (padrão 3, máx 24) - ignorado se 'data' for informado"},
+                "data": {"type": "string", "description": "Data específica no formato AAAA-MM-DD pra ver só os movimentos daquele dia - opcional, tem prioridade sobre 'meses'"},
             },
         },
     },
@@ -399,23 +409,46 @@ def executar_ferramenta(nome, entrada):
     if nome == "consultar_previsao_por_vencimento":
         return consultar_previsao_por_vencimento(entrada.get("meses", 3))
     if nome == "consultar_movimentos":
-        return consultar_movimentos(entrada.get("tipo", "pagamento"), entrada.get("nome"), entrada.get("meses", 3))
+        return consultar_movimentos(entrada.get("tipo", "pagamento"), entrada.get("nome"), entrada.get("meses", 3), entrada.get("data"))
     if nome == "consultar_aprovacoes":
         return consultar_aprovacoes(entrada.get("fornecedor"), entrada.get("dias", 90))
     return {"erro": "ferramenta desconhecida"}
 
 
+# BUG CORRIGIDO (v0.8.1): o prompt antigo dizia fixo "feita pra ajudar a
+# Maria" - o modelo não sabe quem está digitando de verdade (login é feito
+# por e-mail/senha, não passa nome nenhum pro chat), então ele ADIVINHAVA e
+# chamava qualquer pessoa logada de "Maria" (visto ao vivo: Rafael testando e
+# recebendo "Perfeito, Maria!"). Corrigido: usa o e-mail real da sessão
+# logada (não inventa nome) e o prompt não fixa mais mais uma pessoa
+# específica como "a usuária".
+_email_logado = st.session_state.get("usuario", "")
+_nome_logado = _email_logado.split("@")[0].split(".")[0].capitalize() if _email_logado else None
+
 SYSTEM_PROMPT = (
-    "Você é a TIA.go, assistente financeira da EnerMais, feita pra ajudar a Maria (gerente "
-    "financeira) a acompanhar e prever o fluxo de caixa. Responda só com dados que vieram "
+    "Você é a TIA.go, assistente financeira da EnerMais - ajuda a gerência financeira e "
+    "outras pessoas autorizadas a acompanhar e prever o fluxo de caixa.\n"
+    + (
+        f"A pessoa logada agora é {_nome_logado} ({_email_logado}) — pode se dirigir a ela "
+        f"por esse nome, mas NUNCA chame ninguém de 'Maria' ou qualquer outro nome que não "
+        f"seja esse.\n\n"
+        if _nome_logado else "\n"
+    )
+    + f"A data de HOJE é {date.today().isoformat()} — use esse fato pra resolver qualquer "
+    "expressão de data relativa ('ontem', 'semana passada', 'esse mês'), nunca confie na sua "
+    "própria noção de 'hoje' (lição do projeto MarIA original: cálculo de data relativa feito "
+    "'de cabeça' pelo modelo já deu resposta errada antes, mesma pergunta variando resultado).\n\n"
+    "Responda só com dados que vieram "
     "de verdade das ferramentas — nunca invente número, data ou valor. Se a ferramenta não "
     "trouxer dado suficiente pra responder, diga isso claramente em vez de estimar.\n\n"
     "Guia de qual ferramenta usar (importante, escolha pela intenção real da pergunta, não "
     "só pela palavra 'histórico'):\n"
     "- 'o que já foi pago/recebido', 'histórico de pagamento/recebimento', 'quanto pagamos "
-    "pro fornecedor X', 'quando recebemos do cliente Y' → consultar_movimentos. É dado REAL "
-    "do Sienge (data real do evento), funciona desde o primeiro dia, NÃO precisa de "
-    "histórico acumulado.\n"
+    "pro fornecedor X', 'quando recebemos do cliente Y', 'o que pagamos no dia D' → "
+    "consultar_movimentos (use o parâmetro 'data', formato AAAA-MM-DD, pra um dia específico "
+    "— resolva expressões relativas tipo 'ontem'/'semana passada' usando a data de HOJE dada "
+    "acima, com cuidado na aritmética). É dado REAL do Sienge (data real do evento), funciona "
+    "desde o primeiro dia, NÃO precisa de histórico acumulado.\n"
     "- 'quem aprovou', 'quando foi aprovado' → consultar_aprovacoes. Mesma coisa, dado real, "
     "sem depender de acúmulo.\n"
     "- 'quanto vai vencer', 'previsão dos próximos meses', 'projeção' → "
@@ -486,7 +519,8 @@ with col_dash:
         elif extra["tool"] == "consultar_movimentos":
             tipo = extra["input"].get("tipo", "pagamento")
             nome = extra["input"].get("nome")
-            titulo = f"Gerado pela conversa — movimentos de {tipo}" + (f" ({nome})" if nome else "")
+            data_filtro = extra["input"].get("data")
+            titulo = f"Gerado pela conversa — movimentos de {tipo}" + (f" ({nome})" if nome else "") + (f" — {data_filtro}" if data_filtro else "")
             st.caption(titulo)
             res = extra["resultado"]
             if res["movimentos"]:
@@ -506,37 +540,31 @@ with col_chat:
     if "mensagens" not in st.session_state:
         st.session_state.mensagens = []
 
-    # HISTÓRICO CORRIGIDO (31/08/2026): a versão anterior chamava
-    # st.chat_input DENTRO de um st.container(height=...), supondo que isso
-    # bastava pra fixar o input no rodapé (era o que a doc antiga do
-    # Streamlit meio que sugeria). Confirmado com a doc oficial + um
-    # mantenedor do Streamlit no fórum: isso NUNCA foi verdade - chat_input
-    # só fica fixo (position:fixed) no rodapé quando chamado direto no corpo
-    # da página; dentro de QUALQUER container ele vira um elemento comum,
-    # "inline", que sobe/desce junto com o conteúdo - exatamente o sintoma
-    # reportado (input começa no topo, desce conforme a conversa cresce, e
-    # some pra baixo ao rolar). Fix real: biblioteca `streamlit-float`
-    # (padrão usado pela comunidade pra esse layout exato de dashboard+chat
-    # lado a lado), que fixa a posição de um container via CSS relativo à
-    # VIEWPORT, não ao container - por isso o cálculo de %/rem abaixo é uma
-    # aproximação pra bater com a coluna direita (2 colunas 50/50); pode
-    # precisar de ajuste fino visual (mesmo espírito da altura do chat, v0.7.5).
-    altura_chat = 900 if st.session_state.get("dash_extra") else 560
-    historico_box = st.container(height=altura_chat)
-    with historico_box:
-        for m in st.session_state.mensagens:
-            with st.chat_message(m["role"]):
-                st.markdown(m["content"] if isinstance(m["content"], str) else "(ferramenta)")
-
-    input_box = st.container()
-    with input_box:
+    # HISTÓRICO — v0.8.0 tentou `streamlit-float` (position:fixed relativo à
+    # VIEWPORT) pra fixar o chat_input; funcionou de baixo pra cima, mas
+    # ficou visualmente "solto": o input não alinhava com a largura real da
+    # coluna (relativo à tela inteira, não à coluna) e sobrava um vão entre
+    # o card de mensagens e o input, como 2 caixas separadas em vez de 1 chat
+    # só. Revertido (v0.8.1) pro padrão mais simples e robusto recomendado
+    # pela própria comunidade Streamlit pra esse caso: NÃO tentar fixar o
+    # input (position fixed/float) - só colocar o histórico dentro de um
+    # container de ALTURA FIXA (rola por dentro) e o chat_input logo abaixo
+    # dele, em fluxo normal, os dois dentro do MESMO container com borda. Como
+    # a altura do card de mensagens não muda (é fixa), o input sempre fica
+    # "colado" embaixo dele, sem precisar simular posição fixa nem calcular
+    # % de tela - resolve o "unir os containers" e é bem mais simples de
+    # manter. Trade-off aceito: o input não fica fixo se a página inteira
+    # rolar (não deveria rolar, já que cada coluna tem sua própria altura
+    # controlada).
+    altura_historico = 820 if st.session_state.get("dash_extra") else 480
+    chat_card = st.container(border=True)
+    with chat_card:
+        historico_box = st.container(height=altura_historico)
+        with historico_box:
+            for m in st.session_state.mensagens:
+                with st.chat_message(m["role"]):
+                    st.markdown(m["content"] if isinstance(m["content"], str) else "(ferramenta)")
         pergunta = st.chat_input("Pergunte sobre o fluxo de caixa...")
-    input_box.float(
-        float_css_helper(
-            left="52%", right="2rem", bottom="1.5rem",
-            background="var(--background-color, #0e1117)", padding="0.5rem 0 0 0",
-        )
-    )
 
     # Padrão de 2 fases (evita o bug de ordem visto no teste real: nunca
     # renderizar a mensagem nova "na mão" fora do loop - sempre grava no
