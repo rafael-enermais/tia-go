@@ -143,8 +143,25 @@ def consultar_totais_atuais():
         .order("id")
         .range(s, e)
     )
+    # BUG REAL encontrado em 31/08/2026 revisando o código a pedido do Rafael
+    # ("confere os dados, desconfio que esteja errado"): antes filtrava só
+    # authorization_status == "S" (aprovado) ou == "N" (não aprovado) - toda
+    # linha com QUALQUER outro valor (ex.: status intermediário de aprovação
+    # em múltiplos níveis, ou nulo) ficava de fora das DUAS somas, e
+    # pagar_total = pagar_aprovado + pagar_nao_aprovado, então essas linhas
+    # também sumiam do total, silenciosamente (sem erro, sem aviso).
+    # consultar_previsao_por_vencimento já usava a lógica certa (else vira
+    # "não aprovado", sem exigir literal "N") - agora as duas funções usam a
+    # mesma regra: só "S" é aprovado, QUALQUER outra coisa (inclusive nulo,
+    # inclusive um status desconhecido) vira "não aprovado". Isso GARANTE por
+    # construção que pagar_aprovado + pagar_nao_aprovado == sum(balance_amount)
+    # das linhas em aberto, sem depender de eu saber de antemão quais valores
+    # authorization_status pode assumir no Sienge real.
+    # AINDA NÃO CONFIRMADO se isso mudou algum número na prática - depende do
+    # Rafael rodar a query de conferência (ver mensagem) e ver se existe
+    # status fora de S/N nos dados reais.
     pagar_aprovado = sum(r["balance_amount"] for r in pagar if r["authorization_status"] == "S")
-    pagar_nao_aprovado = sum(r["balance_amount"] for r in pagar if r["authorization_status"] == "N")
+    pagar_nao_aprovado = sum(r["balance_amount"] for r in pagar if r["authorization_status"] != "S")
     receber_total = sum(r["balance_amount"] for r in receber)
     return {
         "pagar_aprovado": pagar_aprovado,
@@ -556,14 +573,43 @@ with col_chat:
     # manter. Trade-off aceito: o input não fica fixo se a página inteira
     # rolar (não deveria rolar, já que cada coluna tem sua própria altura
     # controlada).
-    altura_historico = 820 if st.session_state.get("dash_extra") else 480
+    # FIXADO (v0.8.2): Rafael pediu pra parar de alternar 480/820 conforme o
+    # dashboard reage à conversa, e deixar sempre no tamanho "grande". Tentei
+    # avaliar esticar via CSS (unidade vh) amarrado no `key` do container
+    # pra usar o espaço extra que sobra na tela dele, mas o próprio Streamlit
+    # tem uma limitação documentada: a classe `st-key-<key>` é criada DENTRO
+    # do container, não no elemento que controla a altura/scroll - ou seja,
+    # esse CSS não teria garantia de funcionar sem eu testar ao vivo, e não
+    # tenho como rodar Streamlit aqui pra validar antes de te mandar (fonte:
+    # github.com/streamlit/streamlit/issues/10674). Fixar um valor maior é a
+    # via garantida - se quiser tentar esticar até o fim da tela depois, dá
+    # pra testar o CSS como experimento à parte, sem risco pro que já funciona.
+    altura_historico = 820
+
+    def escapar_dolar_markdown(texto):
+        """
+        BUG REAL confirmado em 31/08/2026 (visto nas capturas: "**" solto e
+        números com fonte esquisita tipo "R  48.506.481,33"): st.markdown
+        trata "$" como delimitador de LaTeX por padrão (comportamento
+        documentado do Streamlit, confirmado em discuss.streamlit.io). Toda
+        vez que a resposta tem 2+ "R$" na mesma mensagem, o texto ENTRE eles
+        vira "modo matemático" (fonte monoespaçada) e engole qualquer "**"
+        que estava no meio - sobra "**" literal solto fora do trecho
+        engolido. Fix recomendado pela própria comunidade: escapar "$" como
+        "\\$" antes de mandar pro st.markdown (aplicado só na hora de
+        renderizar, não no texto guardado em session_state, que continua cru
+        pro contexto da API).
+        """
+        return texto.replace("$", "\\$")
+
     chat_card = st.container(border=True)
     with chat_card:
         historico_box = st.container(height=altura_historico)
         with historico_box:
             for m in st.session_state.mensagens:
                 with st.chat_message(m["role"]):
-                    st.markdown(m["content"] if isinstance(m["content"], str) else "(ferramenta)")
+                    conteudo = m["content"] if isinstance(m["content"], str) else "(ferramenta)"
+                    st.markdown(escapar_dolar_markdown(conteudo))
         pergunta = st.chat_input("Pergunte sobre o fluxo de caixa...")
 
     # Padrão de 2 fases (evita o bug de ordem visto no teste real: nunca
