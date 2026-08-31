@@ -19,7 +19,7 @@ abaixo e' um placeholder, nao fato confirmado contra a conta da EnerMais).
 
 import base64
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import streamlit as st
 from supabase import create_client
@@ -432,6 +432,82 @@ def executar_ferramenta(nome, entrada):
     return {"erro": "ferramenta desconhecida"}
 
 
+def gerar_relatorio_html(extra):
+    """
+    NOVO (v0.9.0): gera um relatório HTML autocontido a partir do que já está
+    plotado no dashboard reativo (dash_extra) - mesmo dado, empacotado num
+    arquivo único pra baixar, abrir em qualquer navegador, mandar por
+    e-mail/Teams, ou imprimir em PDF (Ctrl+P > Salvar como PDF, funciona em
+    qualquer navegador, sem precisar de biblioteca de PDF no servidor).
+    ZERO dependência nova: reusa plotly (já instalado, via fig.to_html()) e
+    pandas (.to_html()) - não precisa reportlab/kaleido/weasyprint. Se no
+    futuro fizer sentido gerar um .pdf de verdade (não só HTML imprimível),
+    aí sim vale avaliar uma lib nova - não antecipar essa complexidade agora.
+    """
+    agora = datetime.now().strftime("%d/%m/%Y %H:%M")
+    usuario = st.session_state.get("usuario", "")
+    tool = extra["tool"]
+    titulo = "Relatório TIA.go"
+    corpo = "<p>Nenhum dado encontrado para essa consulta.</p>"
+
+    if tool == "consultar_maiores_vencimentos":
+        tipo = extra["input"].get("tipo", "pagar")
+        titulo = f"Maiores vencimentos ({tipo})"
+        if extra["resultado"]:
+            corpo = pd.DataFrame(extra["resultado"]).to_html(index=False, border=0, classes="tabela")
+
+    elif tool == "consultar_previsao_por_vencimento":
+        meses = extra["input"].get("meses", 3)
+        titulo = f"Previsão por vencimento ({meses} meses)"
+        if extra["resultado"]:
+            df = pd.DataFrame(extra["resultado"])
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=df["mes"], y=df["pagar_total"], name="A pagar"))
+            fig.add_trace(go.Bar(x=df["mes"], y=df["receber_total"], name="A receber"))
+            fig.update_layout(barmode="group", height=380, margin=dict(t=20))
+            corpo = fig.to_html(full_html=False, include_plotlyjs="cdn") + df.to_html(index=False, border=0, classes="tabela")
+
+    elif tool == "consultar_movimentos":
+        tipo = extra["input"].get("tipo", "pagamento")
+        nome = extra["input"].get("nome")
+        data_filtro = extra["input"].get("data")
+        titulo = f"Movimentos de {tipo}" + (f" — {nome}" if nome else "") + (f" — {data_filtro}" if data_filtro else "")
+        res = extra["resultado"]
+        if res["movimentos"]:
+            corpo = (
+                f"<p class='total'>Total no período: R$ {res['total']:,.2f} ({res['quantidade']} movimentos)</p>"
+                + pd.DataFrame(res["movimentos"]).to_html(index=False, border=0, classes="tabela")
+            )
+
+    elif tool == "consultar_aprovacoes":
+        titulo = "Histórico de aprovações"
+        if extra["resultado"]:
+            corpo = pd.DataFrame(extra["resultado"]).to_html(index=False, border=0, classes="tabela")
+
+    return f"""<!DOCTYPE html>
+<html lang="pt-br"><head><meta charset="utf-8">
+<title>{titulo} — TIA.go</title>
+<style>
+body {{ font-family: -apple-system, "Segoe UI", Arial, sans-serif; background:#0e1117; color:#e6e6e6; margin:0; padding:32px; }}
+.cabecalho {{ display:flex; align-items:center; gap:16px; margin-bottom:24px; }}
+.cabecalho img {{ height:40px; filter:brightness(0) invert(1); }}
+h1 {{ font-size:20px; margin:0; }}
+.meta {{ color:#999; font-size:13px; margin-bottom:24px; }}
+.total {{ font-size:18px; font-weight:600; margin:16px 0; }}
+table.tabela {{ border-collapse:collapse; width:100%; font-size:13px; margin-top:12px; }}
+table.tabela th, table.tabela td {{ border:1px solid #333; padding:6px 10px; text-align:left; }}
+table.tabela th {{ background:#1c1f26; }}
+@media print {{ body {{ background:#fff; color:#000; }} table.tabela th {{ background:#eee; }} .cabecalho img {{ filter:none; }} }}
+</style></head>
+<body>
+<div class="cabecalho">
+<img src="data:image/png;base64,{logo_base64()}">
+<div><h1>{titulo}</h1><div class="meta">Gerado por TIA.go em {agora} — {usuario}</div></div>
+</div>
+{corpo}
+</body></html>"""
+
+
 # BUG CORRIGIDO (v0.8.1): o prompt antigo dizia fixo "feita pra ajudar a
 # Maria" - o modelo não sabe quem está digitando de verdade (login é feito
 # por e-mail/senha, não passa nome nenhum pro chat), então ele ADIVINHAVA e
@@ -493,9 +569,20 @@ with col_dash:
     c2.metric("A pagar não aprovado", f"R$ {totais['pagar_nao_aprovado']:,.2f}")
     c3.metric("A receber", f"R$ {totais['receber_total']:,.2f}")
     st.metric("Saldo projetado (receber − pagar)", f"R$ {totais['saldo_projetado']:,.2f}")
+    # CLAREZA (v0.9.0, confusão real reportada pelo Rafael: mexeu no seletor
+    # abaixo e os 4 números acima não mudaram): os 4 cards acima são O SALDO
+    # ATUAL EM ABERTO (soma de balance_amount>0, SEM filtro de data - inclui
+    # TUDO que ainda não foi pago/recebido, de qualquer vencimento, passado
+    # ou futuro) - não existe "período" pra eles, são sempre "agora". O
+    # seletor abaixo só controla o GRÁFICO de evolução diária (like/mês a
+    # mês NÃO, é literal dia a dia do nosso snapshot próprio).
+    st.caption(
+        "Os 4 números acima são o saldo ATUAL em aberto (tudo que falta pagar/receber, "
+        "sem corte de data) — não mudam com o período abaixo, que é só do gráfico."
+    )
 
     PERIODOS = {"Últimos 7 dias": 7, "Últimos 15 dias": 15, "Últimos 30 dias": 30, "Últimos 90 dias": 90, "Tudo": 3650}
-    periodo_label = st.selectbox("Período do histórico", list(PERIODOS.keys()), index=2)
+    periodo_label = st.selectbox("Período do gráfico de evolução diária", list(PERIODOS.keys()), index=2)
     hist = consultar_historico_diario(PERIODOS[periodo_label])
     if hist:
         df = pd.DataFrame(hist).sort_values("capturado_em")
@@ -551,6 +638,16 @@ with col_dash:
                 st.dataframe(pd.DataFrame(extra["resultado"]), use_container_width=True, hide_index=True)
             else:
                 st.caption("Nenhuma aprovação encontrada no período.")
+
+        # NOVO (v0.9.0, pedido do Rafael): baixa o que está plotado acima
+        # como um relatório HTML — abre em qualquer navegador, dá pra
+        # imprimir em PDF (Ctrl+P) ou mandar direto por e-mail/Teams.
+        st.download_button(
+            "📄 Baixar relatório desta consulta",
+            data=gerar_relatorio_html(extra),
+            file_name=f"tia_go_{extra['tool']}_{date.today().isoformat()}.html",
+            mime="text/html",
+        )
 
 with col_chat:
     st.subheader("Pergunte à TIA.go")
