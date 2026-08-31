@@ -432,6 +432,10 @@ def executar_ferramenta(nome, entrada):
     return {"erro": "ferramenta desconhecida"}
 
 
+NAVY = "#171D62"   # amostrado direto de logo-enermais.png (pixel mais comum: rgb(23,28,96))
+LARANJA = "#FA9C20"  # idem (pixel mais comum: rgb(250,156,32))
+
+
 def gerar_relatorio_html(extra):
     """
     NOVO (v0.9.0): gera um relatório HTML autocontido a partir do que já está
@@ -443,6 +447,19 @@ def gerar_relatorio_html(extra):
     pandas (.to_html()) - não precisa reportlab/kaleido/weasyprint. Se no
     futuro fizer sentido gerar um .pdf de verdade (não só HTML imprimível),
     aí sim vale avaliar uma lib nova - não antecipar essa complexidade agora.
+
+    AJUSTADO (mesmo dia): 1ª versão saiu com fundo escuro e o gráfico de
+    barras saindo TODO PRETO (visto ao vivo pelo Rafael) - causa exata do
+    preto não isolada com certeza (suspeita: o tema/colorway padrão do
+    Plotly não estava sendo aplicado do jeito esperado dentro do HTML
+    embutido), mas em vez de ficar caçando a causa, troquei por uma correção
+    que elimina a dependência do padrão: cor de cada série do gráfico
+    fixada explicitamente (`marker_color`), fundo do gráfico fixado em
+    branco (`template="plotly_white"`) - garante a cor certa não importa o
+    que o tema padrão faça. Aproveitado pra aplicar a identidade visual da
+    EnerMais (navy + laranja, cores extraídas de verdade do PNG da logo,
+    não chutadas) e trocar o relatório inteiro pro fundo claro (mais
+    apropriado pra imprimir/mandar pra Maria do que o tema escuro do app).
     """
     agora = datetime.now().strftime("%d/%m/%Y %H:%M")
     usuario = st.session_state.get("usuario", "")
@@ -462,9 +479,13 @@ def gerar_relatorio_html(extra):
         if extra["resultado"]:
             df = pd.DataFrame(extra["resultado"])
             fig = go.Figure()
-            fig.add_trace(go.Bar(x=df["mes"], y=df["pagar_total"], name="A pagar"))
-            fig.add_trace(go.Bar(x=df["mes"], y=df["receber_total"], name="A receber"))
-            fig.update_layout(barmode="group", height=380, margin=dict(t=20))
+            fig.add_trace(go.Bar(x=df["mes"], y=df["pagar_total"], name="A pagar", marker_color=NAVY))
+            fig.add_trace(go.Bar(x=df["mes"], y=df["receber_total"], name="A receber", marker_color=LARANJA))
+            fig.update_layout(
+                barmode="group", height=380, margin=dict(t=20),
+                template="plotly_white", paper_bgcolor="white", plot_bgcolor="white",
+                font=dict(color="#1a1a1a"),
+            )
             corpo = fig.to_html(full_html=False, include_plotlyjs="cdn") + df.to_html(index=False, border=0, classes="tabela")
 
     elif tool == "consultar_movimentos":
@@ -488,23 +509,33 @@ def gerar_relatorio_html(extra):
 <html lang="pt-br"><head><meta charset="utf-8">
 <title>{titulo} — TIA.go</title>
 <style>
-body {{ font-family: -apple-system, "Segoe UI", Arial, sans-serif; background:#0e1117; color:#e6e6e6; margin:0; padding:32px; }}
-.cabecalho {{ display:flex; align-items:center; gap:16px; margin-bottom:24px; }}
-.cabecalho img {{ height:40px; filter:brightness(0) invert(1); }}
-h1 {{ font-size:20px; margin:0; }}
-.meta {{ color:#999; font-size:13px; margin-bottom:24px; }}
-.total {{ font-size:18px; font-weight:600; margin:16px 0; }}
-table.tabela {{ border-collapse:collapse; width:100%; font-size:13px; margin-top:12px; }}
-table.tabela th, table.tabela td {{ border:1px solid #333; padding:6px 10px; text-align:left; }}
-table.tabela th {{ background:#1c1f26; }}
-@media print {{ body {{ background:#fff; color:#000; }} table.tabela th {{ background:#eee; }} .cabecalho img {{ filter:none; }} }}
+:root {{ --navy:{NAVY}; --laranja:{LARANJA}; }}
+* {{ box-sizing:border-box; }}
+body {{ font-family: -apple-system, "Segoe UI", Arial, sans-serif; background:#f4f5f9; color:#1a1a1a; margin:0; padding:0; }}
+.cabecalho {{ display:flex; align-items:center; gap:16px; padding:22px 32px; background:var(--navy); }}
+.cabecalho img {{ height:44px; }}
+.cabecalho h1 {{ color:#fff; font-size:20px; margin:0; }}
+.cabecalho .meta {{ color:#c7c9e8; font-size:13px; margin-top:2px; }}
+.faixa {{ height:4px; background:var(--laranja); }}
+.conteudo {{ padding:28px 32px 40px; }}
+.total {{ font-size:18px; font-weight:600; margin:4px 0 16px; color:var(--navy); }}
+table.tabela {{ border-collapse:collapse; width:100%; font-size:13px; margin-top:12px; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.08); }}
+table.tabela th {{ background:var(--navy); color:#fff; padding:9px 12px; text-align:left; font-weight:600; }}
+table.tabela td {{ padding:8px 12px; border-bottom:1px solid #ececec; }}
+table.tabela tr:nth-child(even) td {{ background:#fafafa; }}
+@media print {{
+  .cabecalho, .faixa, table.tabela th {{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }}
+}}
 </style></head>
 <body>
 <div class="cabecalho">
 <img src="data:image/png;base64,{logo_base64()}">
 <div><h1>{titulo}</h1><div class="meta">Gerado por TIA.go em {agora} — {usuario}</div></div>
 </div>
+<div class="faixa"></div>
+<div class="conteudo">
 {corpo}
+</div>
 </body></html>"""
 
 
