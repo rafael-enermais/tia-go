@@ -1,4 +1,5 @@
-streamlit
+streamlit==1.62.0
+streamlit-float==0.4.0
 supabase
 anthropic
 pandas

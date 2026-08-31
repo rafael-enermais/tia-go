@@ -23,9 +23,12 @@ from datetime import date, timedelta
 
 import streamlit as st
 from supabase import create_client
+from streamlit_float import float_init, float_css_helper
 import anthropic
 import pandas as pd
 import plotly.graph_objects as go
+
+float_init()
 
 MODEL_ID = "claude-sonnet-4-5"  # TODO confirmar antes de ir pra produção
 
@@ -95,16 +98,53 @@ sb = get_supabase()
 
 
 # ---------- Ferramentas que o Claude pode chamar (zero alucinação: só dado real) ----------
+def fetch_all(query_builder_fn, page_size=1000):
+    """
+    Busca TODAS as linhas de uma query Supabase, paginando com .range().
+
+    BUG REAL confirmado em 31/08/2026 (não suposição): a API do Supabase
+    (PostgREST) limita cada resposta a no máximo 1000 linhas por padrão
+    (config "Max Rows" em Settings > API, default 1000 mesmo em projeto
+    hospedado) - qualquer `.execute()` sem paginação, numa tabela/filtro que
+    bate mais que isso, trunca silenciosamente, SEM ERRO nenhum. parcelas_pagar
+    já tinha ~1958 linhas em aberto (balance_amount>0) desde 24/08 - acima do
+    limite. Isso explica o "Setembro" saindo diferente entre 2 chamadas
+    seguidas da mesma ferramenta (sem ORDER BY, o Postgres não garante quais
+    1000 linhas entre as que batem o filtro voltam a cada chamada) e explica,
+    em parte, discrepâncias antigas entre o app e conferência via SQL Editor
+    (SQL Editor roda direto no Postgres, sem passar pelo limite da API - por
+    isso os números batiam lá e não no app).
+
+    query_builder_fn: função que recebe (start, end) e devolve a query já
+    com .range(start, end) aplicado (e .order(...) definido ANTES do
+    .range(), pra paginação ser determinística), pronta pra .execute().
+    """
+    todas = []
+    start = 0
+    while True:
+        end = start + page_size - 1
+        pagina = query_builder_fn(start, end).execute().data
+        todas.extend(pagina)
+        if len(pagina) < page_size:
+            break
+        start += page_size
+    return todas
+
+
 def consultar_totais_atuais():
-    pagar = (
-        sb.table("parcelas_pagar")
+    pagar = fetch_all(
+        lambda s, e: sb.table("parcelas_pagar")
         .select("balance_amount, authorization_status")
         .gt("balance_amount", 0)
-        .execute()
-        .data
+        .order("id")
+        .range(s, e)
     )
-    receber = (
-        sb.table("parcelas_receber").select("balance_amount").gt("balance_amount", 0).execute().data
+    receber = fetch_all(
+        lambda s, e: sb.table("parcelas_receber")
+        .select("balance_amount")
+        .gt("balance_amount", 0)
+        .order("id")
+        .range(s, e)
     )
     pagar_aprovado = sum(r["balance_amount"] for r in pagar if r["authorization_status"] == "S")
     pagar_nao_aprovado = sum(r["balance_amount"] for r in pagar if r["authorization_status"] == "N")
@@ -161,21 +201,21 @@ def consultar_previsao_por_vencimento(meses=3):
     meses = max(1, min(int(meses), 12))
     hoje = date.today()
     limite = (hoje + timedelta(days=31 * meses)).isoformat()
-    pagar = (
-        sb.table("parcelas_pagar")
+    pagar = fetch_all(
+        lambda s, e: sb.table("parcelas_pagar")
         .select("due_date, balance_amount, authorization_status")
         .gt("balance_amount", 0)
         .lte("due_date", limite)
-        .execute()
-        .data
+        .order("id")
+        .range(s, e)
     )
-    receber = (
-        sb.table("parcelas_receber")
+    receber = fetch_all(
+        lambda s, e: sb.table("parcelas_receber")
         .select("due_date, balance_amount")
         .gt("balance_amount", 0)
         .lte("due_date", limite)
-        .execute()
-        .data
+        .order("id")
+        .range(s, e)
     )
     buckets = {}
     for p in pagar:
@@ -217,15 +257,20 @@ def consultar_movimentos(tipo="pagamento", nome=None, meses=3):
         tabela, campo_nome = "movimentos_recebimento", "client_name"
     else:
         tabela, campo_nome = "movimentos_pagamento", "creditor_name"
-    q = (
-        sb.table(tabela)
-        .select(f"bill_id, installment_id, {campo_nome}, payment_date, net_amount, operation_type_name")
-        .gte("payment_date", desde)
-        .order("payment_date", desc=True)
-    )
-    if nome:
-        q = q.ilike(campo_nome, f"%{nome}%")
-    dados = q.execute().data
+    def montar_query(s, e):
+        q = (
+            sb.table(tabela)
+            .select(f"id, bill_id, installment_id, {campo_nome}, payment_date, net_amount, operation_type_name")
+            .gte("payment_date", desde)
+            .order("payment_date", desc=True)
+            .order("id")
+            .range(s, e)
+        )
+        if nome:
+            q = q.ilike(campo_nome, f"%{nome}%")
+        return q
+
+    dados = fetch_all(montar_query)
     total = sum(d["net_amount"] or 0 for d in dados)
     return {"total": total, "quantidade": len(dados), "movimentos": dados[:50]}
 
@@ -233,15 +278,20 @@ def consultar_movimentos(tipo="pagamento", nome=None, meses=3):
 def consultar_aprovacoes(fornecedor=None, dias=90):
     dias = max(1, min(int(dias), 730))
     desde_dt = date.today() - timedelta(days=dias)
-    q = (
-        sb.table("aprovacoes_pagar")
-        .select("bill_id, installment_id, creditor_name, authorization_user_name, authorization_date, is_last_to_authorize")
-        .gte("authorization_date", desde_dt.isoformat())
-        .order("authorization_date", desc=True)
-    )
-    if fornecedor:
-        q = q.ilike("creditor_name", f"%{fornecedor}%")
-    return q.execute().data[:50]
+    def montar_query(s, e):
+        q = (
+            sb.table("aprovacoes_pagar")
+            .select("id, bill_id, installment_id, creditor_name, authorization_user_name, authorization_date, is_last_to_authorize")
+            .gte("authorization_date", desde_dt.isoformat())
+            .order("authorization_date", desc=True)
+            .order("id")
+            .range(s, e)
+        )
+        if fornecedor:
+            q = q.ilike("creditor_name", f"%{fornecedor}%")
+        return q
+
+    return fetch_all(montar_query)[:50]
 
 
 TOOLS = [
@@ -456,47 +506,37 @@ with col_chat:
     if "mensagens" not in st.session_state:
         st.session_state.mensagens = []
 
-    # Container de altura fixa: histórico rola dentro dele e o chat_input, por
-    # ser chamado DENTRO desse container, fica fixo (colado) no rodapé dele -
-    # é o comportamento nativo do Streamlit pra chat_input em container com
-    # altura definida. Sem isso o input aparecia em fluxo normal (no topo,
-    # empurrando as mensagens pra baixo) em vez de fixo embaixo.
-    #
-    # CSS extra: por padrão, com poucas mensagens, elas ficam no TOPO do
-    # container e sobra um vão vazio grande até o input (que fica fixo no
-    # rodapé) - visualmente parece "flutuando". O trecho abaixo diz pro bloco
-    # de mensagens ser flex-column com justify-content:flex-end, empurrando o
-    # conteúdo pra encostar no input e crescer pra CIMA conforme a conversa
-    # cresce (como um chat comum). É CSS torcendo a estrutura interna do
-    # Streamlit (via a classe do `key="chat_box"`) - funciona nas versões
-    # atuais, mas pode precisar de ajuste se o Streamlit mudar essa estrutura
-    # numa atualização futura (avisa se o efeito parar de funcionar).
-    st.markdown(
-        """
-        <style>
-        .st-key-chat_box [data-testid="stVerticalBlock"] {
-            display: flex;
-            flex-direction: column;
-            justify-content: flex-end;
-            min-height: 100%;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    # Altura do chat ajustada pra acompanhar o dashboard: quando o dashboard
-    # cresce (o gráfico extra gerado pela conversa aparece do lado), o chat
-    # ficava curto e sobrava vão vazio embaixo dele (reportado por Rafael com
-    # print de tela cheia) - aqui não tem como medir a altura real do
-    # dashboard em CSS puro, então a aproximação é: mais alto quando há
-    # dash_extra, senão a altura padrão.
+    # HISTÓRICO CORRIGIDO (31/08/2026): a versão anterior chamava
+    # st.chat_input DENTRO de um st.container(height=...), supondo que isso
+    # bastava pra fixar o input no rodapé (era o que a doc antiga do
+    # Streamlit meio que sugeria). Confirmado com a doc oficial + um
+    # mantenedor do Streamlit no fórum: isso NUNCA foi verdade - chat_input
+    # só fica fixo (position:fixed) no rodapé quando chamado direto no corpo
+    # da página; dentro de QUALQUER container ele vira um elemento comum,
+    # "inline", que sobe/desce junto com o conteúdo - exatamente o sintoma
+    # reportado (input começa no topo, desce conforme a conversa cresce, e
+    # some pra baixo ao rolar). Fix real: biblioteca `streamlit-float`
+    # (padrão usado pela comunidade pra esse layout exato de dashboard+chat
+    # lado a lado), que fixa a posição de um container via CSS relativo à
+    # VIEWPORT, não ao container - por isso o cálculo de %/rem abaixo é uma
+    # aproximação pra bater com a coluna direita (2 colunas 50/50); pode
+    # precisar de ajuste fino visual (mesmo espírito da altura do chat, v0.7.5).
     altura_chat = 900 if st.session_state.get("dash_extra") else 560
-    chat_box = st.container(height=altura_chat, key="chat_box")
-    with chat_box:
+    historico_box = st.container(height=altura_chat)
+    with historico_box:
         for m in st.session_state.mensagens:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"] if isinstance(m["content"], str) else "(ferramenta)")
+
+    input_box = st.container()
+    with input_box:
         pergunta = st.chat_input("Pergunte sobre o fluxo de caixa...")
+    input_box.float(
+        float_css_helper(
+            left="52%", right="2rem", bottom="1.5rem",
+            background="var(--background-color, #0e1117)", padding="0.5rem 0 0 0",
+        )
+    )
 
     # Padrão de 2 fases (evita o bug de ordem visto no teste real: nunca
     # renderizar a mensagem nova "na mão" fora do loop - sempre grava no
