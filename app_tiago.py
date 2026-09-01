@@ -320,6 +320,113 @@ def consultar_aprovacoes(fornecedor=None, dias=90):
     return fetch_all(montar_query)[:50]
 
 
+def consultar_por_unidade_negocio(tipo="pagar", mes=None):
+    # NOVO (v0.10.0, pedido do Rafael): agrupa o saldo em aberto por unidade
+    # de negócio (business_type_name) - campo que já vem do Sienge desde a
+    # 1ª ingestão (Construtora/Energia/Engenharia/Soluções/SMG/Renováveis,
+    # conforme cadastro real - NÃO fixamos essa lista aqui de propósito, o
+    # agrupamento usa o que o Sienge devolver, pra não desatualizar se o
+    # cadastro mudar). `mes` (AAAA-MM) filtra por vencimento (due_date)
+    # dentro desse mês - sem ele, retorna o saldo TOTAL em aberto, sem corte
+    # de data (mesma convenção de consultar_totais_atuais).
+    tabela = "parcelas_pagar" if tipo == "pagar" else "parcelas_receber"
+    campos = (
+        "due_date, balance_amount, business_type_name, authorization_status"
+        if tipo == "pagar" else "due_date, balance_amount, business_type_name"
+    )
+    fim_mes = None
+    if mes:
+        ano, m = map(int, mes.split("-"))
+        fim_mes = f"{ano+1}-01-01" if m == 12 else f"{ano}-{m+1:02d}-01"
+
+    def montar_query(s, e):
+        q = (
+            sb.table(tabela)
+            .select(campos)
+            .gt("balance_amount", 0)
+            .order("id")
+            .range(s, e)
+        )
+        if mes:
+            q = q.gte("due_date", f"{mes}-01").lt("due_date", fim_mes)
+        return q
+
+    dados = fetch_all(montar_query)
+    buckets = {}
+    for d in dados:
+        chave = d.get("business_type_name") or "Sem unidade de negócio cadastrada"
+        if chave not in buckets:
+            buckets[chave] = {"aprovado": 0, "nao_aprovado": 0, "total": 0} if tipo == "pagar" else {"total": 0}
+        b = buckets[chave]
+        valor = d["balance_amount"]
+        if tipo == "pagar":
+            if d.get("authorization_status") == "S":
+                b["aprovado"] += valor
+            else:
+                b["nao_aprovado"] += valor
+        b["total"] += valor
+    linhas = [
+        {"unidade_negocio": k, **v}
+        for k, v in sorted(buckets.items(), key=lambda kv: -kv[1]["total"])
+    ]
+    return {"tipo": tipo, "mes": mes, "por_unidade": linhas}
+
+
+def consultar_por_empresa(tipo="receber", meses=None):
+    # NOVO (v0.10.0, pedido do Rafael): agrupa o saldo em aberto por empresa
+    # (company_name) - útil se o grupo EnerMais fatura por mais de uma
+    # empresa. Mesma lógica de não fixar lista: agrupa pelo que o Sienge
+    # tiver cadastrado. AINDA NÃO CONFIRMADO com dado real se "empresa do
+    # grupo" é melhor representada por company_name, group_company_name,
+    # holding_name ou subsidiary_name - implementado com company_name por
+    # ser o candidato mais direto (a "Empresa" cadastrada no Sienge); trocar
+    # o campo depois é 1 linha (aqui e no SELECT) se o teste com dado real
+    # mostrar que outro campo é mais útil pro que a Maria precisa ver.
+    # `meses` (opcional) limita a parcelas com vencimento nos próximos N
+    # meses; sem ele, retorna o saldo TOTAL em aberto, sem corte de data.
+    tabela = "parcelas_receber" if tipo == "receber" else "parcelas_pagar"
+    campos = (
+        "due_date, balance_amount, company_name"
+        if tipo == "receber" else "due_date, balance_amount, company_name, authorization_status"
+    )
+    limite = None
+    if meses:
+        meses = max(1, min(int(meses), 12))
+        limite = (date.today() + timedelta(days=31 * meses)).isoformat()
+
+    def montar_query(s, e):
+        q = (
+            sb.table(tabela)
+            .select(campos)
+            .gt("balance_amount", 0)
+            .order("id")
+            .range(s, e)
+        )
+        if limite:
+            q = q.lte("due_date", limite)
+        return q
+
+    dados = fetch_all(montar_query)
+    buckets = {}
+    for d in dados:
+        chave = d.get("company_name") or "Sem empresa cadastrada"
+        if chave not in buckets:
+            buckets[chave] = {"aprovado": 0, "nao_aprovado": 0, "total": 0} if tipo == "pagar" else {"total": 0}
+        b = buckets[chave]
+        valor = d["balance_amount"]
+        if tipo == "pagar":
+            if d.get("authorization_status") == "S":
+                b["aprovado"] += valor
+            else:
+                b["nao_aprovado"] += valor
+        b["total"] += valor
+    linhas = [
+        {"empresa": k, **v}
+        for k, v in sorted(buckets.items(), key=lambda kv: -kv[1]["total"])
+    ]
+    return {"tipo": tipo, "meses": meses, "por_empresa": linhas}
+
+
 TOOLS = [
     {
         "name": "consultar_totais_atuais",
@@ -404,6 +511,37 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "consultar_por_unidade_negocio",
+        "description": (
+            "Agrupa o saldo em aberto (a pagar por padrão) por unidade de negócio da "
+            "EnerMais (Construtora, Energia, Engenharia, Soluções, SMG, Renováveis - "
+            "conforme cadastrado no Sienge). Use pra 'quanto devemos/vamos receber na "
+            "Construtora/Energia/etc' ou 'separado por unidade de negócio'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tipo": {"type": "string", "enum": ["pagar", "receber"], "description": "pagar ou receber (padrão pagar)"},
+                "mes": {"type": "string", "description": "Mês no formato AAAA-MM pra filtrar por vencimento - opcional, sem isso retorna o saldo total em aberto, sem corte de data"},
+            },
+        },
+    },
+    {
+        "name": "consultar_por_empresa",
+        "description": (
+            "Agrupa o saldo em aberto (a receber por padrão) por empresa do grupo EnerMais "
+            "(conforme cadastrado no Sienge) - útil quando o grupo fatura por mais de uma "
+            "empresa. Use pra 'quanto vamos receber/devemos por empresa'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tipo": {"type": "string", "enum": ["pagar", "receber"], "description": "pagar ou receber (padrão receber)"},
+                "meses": {"type": "integer", "description": "Limita a parcelas com vencimento nos próximos N meses - opcional, sem isso retorna o saldo total em aberto"},
+            },
+        },
+    },
 ]
 
 # Ferramentas cujo resultado, além de virar texto pro chat, também é plotado
@@ -413,6 +551,8 @@ FERRAMENTAS_VISUAIS = {
     "consultar_previsao_por_vencimento",
     "consultar_movimentos",
     "consultar_aprovacoes",
+    "consultar_por_unidade_negocio",
+    "consultar_por_empresa",
 }
 
 
@@ -429,6 +569,10 @@ def executar_ferramenta(nome, entrada):
         return consultar_movimentos(entrada.get("tipo", "pagamento"), entrada.get("nome"), entrada.get("meses", 3), entrada.get("data"))
     if nome == "consultar_aprovacoes":
         return consultar_aprovacoes(entrada.get("fornecedor"), entrada.get("dias", 90))
+    if nome == "consultar_por_unidade_negocio":
+        return consultar_por_unidade_negocio(entrada.get("tipo", "pagar"), entrada.get("mes"))
+    if nome == "consultar_por_empresa":
+        return consultar_por_empresa(entrada.get("tipo", "receber"), entrada.get("meses"))
     return {"erro": "ferramenta desconhecida"}
 
 
@@ -505,6 +649,56 @@ def gerar_relatorio_html(extra):
         if extra["resultado"]:
             corpo = pd.DataFrame(extra["resultado"]).to_html(index=False, border=0, classes="tabela")
 
+    elif tool == "consultar_por_unidade_negocio":
+        tipo = extra["input"].get("tipo", "pagar")
+        mes = extra["input"].get("mes")
+        titulo = ("A pagar" if tipo == "pagar" else "A receber") + " por unidade de negócio" + (f" — {mes}" if mes else "")
+        linhas = extra["resultado"]["por_unidade"]
+        if linhas:
+            df = pd.DataFrame(linhas)
+            fig = go.Figure()
+            if tipo == "pagar":
+                fig.add_trace(go.Bar(x=df["unidade_negocio"], y=df["aprovado"], name="Aprovado", marker_color=NAVY))
+                fig.add_trace(go.Bar(x=df["unidade_negocio"], y=df["nao_aprovado"], name="Não aprovado", marker_color=LARANJA))
+                fig.update_layout(
+                    barmode="stack", height=380, margin=dict(t=20),
+                    template="plotly_white", paper_bgcolor="white", plot_bgcolor="white",
+                    font=dict(color="#1a1a1a"),
+                )
+            else:
+                fig.add_trace(go.Bar(x=df["unidade_negocio"], y=df["total"], name="Total", marker_color=NAVY))
+                fig.update_layout(
+                    height=380, margin=dict(t=20),
+                    template="plotly_white", paper_bgcolor="white", plot_bgcolor="white",
+                    font=dict(color="#1a1a1a"),
+                )
+            corpo = fig.to_html(full_html=False, include_plotlyjs="cdn") + df.to_html(index=False, border=0, classes="tabela")
+
+    elif tool == "consultar_por_empresa":
+        tipo = extra["input"].get("tipo", "receber")
+        meses = extra["input"].get("meses")
+        titulo = ("A pagar" if tipo == "pagar" else "A receber") + " por empresa" + (f" — próximos {meses} meses" if meses else "")
+        linhas = extra["resultado"]["por_empresa"]
+        if linhas:
+            df = pd.DataFrame(linhas)
+            fig = go.Figure()
+            if tipo == "pagar":
+                fig.add_trace(go.Bar(x=df["empresa"], y=df["aprovado"], name="Aprovado", marker_color=NAVY))
+                fig.add_trace(go.Bar(x=df["empresa"], y=df["nao_aprovado"], name="Não aprovado", marker_color=LARANJA))
+                fig.update_layout(
+                    barmode="stack", height=380, margin=dict(t=20),
+                    template="plotly_white", paper_bgcolor="white", plot_bgcolor="white",
+                    font=dict(color="#1a1a1a"),
+                )
+            else:
+                fig.add_trace(go.Bar(x=df["empresa"], y=df["total"], name="Total", marker_color=NAVY))
+                fig.update_layout(
+                    height=380, margin=dict(t=20),
+                    template="plotly_white", paper_bgcolor="white", plot_bgcolor="white",
+                    font=dict(color="#1a1a1a"),
+                )
+            corpo = fig.to_html(full_html=False, include_plotlyjs="cdn") + df.to_html(index=False, border=0, classes="tabela")
+
     return f"""<!DOCTYPE html>
 <html lang="pt-br"><head><meta charset="utf-8">
 <title>{titulo} — TIA.go</title>
@@ -578,14 +772,21 @@ SYSTEM_PROMPT = (
     "- 'quanto vai vencer', 'previsão dos próximos meses', 'projeção' → "
     "consultar_previsao_por_vencimento. Usa a data de vencimento das parcelas já "
     "cadastradas, também não depende de acúmulo.\n"
+    "- 'quanto devemos/vamos receber na Construtora/Energia/Engenharia/Soluções/SMG/"
+    "Renováveis', 'separado por unidade de negócio' → consultar_por_unidade_negocio "
+    "(parâmetro 'mes', formato AAAA-MM, filtra por vencimento - sem ele, é o saldo total "
+    "em aberto, sem corte de data).\n"
+    "- 'quanto devemos/vamos receber por empresa', 'separado por empresa do grupo' → "
+    "consultar_por_empresa.\n"
     "- só use consultar_historico_diario se a pergunta for especificamente sobre a EVOLUÇÃO "
     "DO SALDO TOTAL EM ABERTO dia a dia (ex.: 'como o saldo agregado mudou nos últimos "
     "dias') — essa é a única métrica que realmente depende de dias reais se acumularem, "
     "avise isso se o histórico ainda for curto, mas SEMPRE ofereça consultar_movimentos ou "
     "consultar_previsao_por_vencimento como alternativa que já funciona.\n\n"
     "Quando usar consultar_maiores_vencimentos, consultar_previsao_por_vencimento, "
-    "consultar_movimentos ou consultar_aprovacoes, o resultado também aparece como "
-    "tabela/gráfico no dashboard ao lado — pode avisar a pessoa disso na resposta."
+    "consultar_movimentos, consultar_aprovacoes, consultar_por_unidade_negocio ou "
+    "consultar_por_empresa, o resultado também aparece como tabela/gráfico no dashboard "
+    "ao lado — pode avisar a pessoa disso na resposta."
 )
 
 
@@ -669,6 +870,50 @@ with col_dash:
                 st.dataframe(pd.DataFrame(extra["resultado"]), use_container_width=True, hide_index=True)
             else:
                 st.caption("Nenhuma aprovação encontrada no período.")
+        elif extra["tool"] == "consultar_por_unidade_negocio":
+            tipo = extra["input"].get("tipo", "pagar")
+            mes = extra["input"].get("mes")
+            st.caption(
+                f"Gerado pela conversa — {tipo} por unidade de negócio"
+                + (f" ({mes})" if mes else " (saldo total em aberto)")
+            )
+            linhas = extra["resultado"]["por_unidade"]
+            if linhas:
+                df_un = pd.DataFrame(linhas)
+                fig_un = go.Figure()
+                if tipo == "pagar":
+                    fig_un.add_trace(go.Bar(x=df_un["unidade_negocio"], y=df_un["aprovado"], name="Aprovado"))
+                    fig_un.add_trace(go.Bar(x=df_un["unidade_negocio"], y=df_un["nao_aprovado"], name="Não aprovado"))
+                    fig_un.update_layout(barmode="stack", height=320, margin=dict(t=20))
+                else:
+                    fig_un.add_trace(go.Bar(x=df_un["unidade_negocio"], y=df_un["total"], name="Total"))
+                    fig_un.update_layout(height=320, margin=dict(t=20))
+                st.plotly_chart(fig_un, use_container_width=True)
+                st.dataframe(df_un, use_container_width=True, hide_index=True)
+            else:
+                st.caption("Nenhuma parcela em aberto encontrada.")
+        elif extra["tool"] == "consultar_por_empresa":
+            tipo = extra["input"].get("tipo", "receber")
+            meses = extra["input"].get("meses")
+            st.caption(
+                f"Gerado pela conversa — {tipo} por empresa"
+                + (f" (próximos {meses} meses)" if meses else " (saldo total em aberto)")
+            )
+            linhas = extra["resultado"]["por_empresa"]
+            if linhas:
+                df_emp = pd.DataFrame(linhas)
+                fig_emp = go.Figure()
+                if tipo == "pagar":
+                    fig_emp.add_trace(go.Bar(x=df_emp["empresa"], y=df_emp["aprovado"], name="Aprovado"))
+                    fig_emp.add_trace(go.Bar(x=df_emp["empresa"], y=df_emp["nao_aprovado"], name="Não aprovado"))
+                    fig_emp.update_layout(barmode="stack", height=320, margin=dict(t=20))
+                else:
+                    fig_emp.add_trace(go.Bar(x=df_emp["empresa"], y=df_emp["total"], name="Total"))
+                    fig_emp.update_layout(height=320, margin=dict(t=20))
+                st.plotly_chart(fig_emp, use_container_width=True)
+                st.dataframe(df_emp, use_container_width=True, hide_index=True)
+            else:
+                st.caption("Nenhuma parcela em aberto encontrada.")
 
         # NOVO (v0.9.0, pedido do Rafael): baixa o que está plotado acima
         # como um relatório HTML — abre em qualquer navegador, dá pra
