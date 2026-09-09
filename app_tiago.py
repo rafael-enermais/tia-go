@@ -29,6 +29,12 @@ import plotly.graph_objects as go
 
 MODEL_ID = "claude-sonnet-4-5"  # TODO confirmar antes de ir pra produção
 
+# NOVO (09/09, pedido do Rafael): marca essa como a v1.0 "oficial" pro usuario ver no
+# rodape da barra lateral - a partir de agora essa e a versao que aparece pra quem usa
+# o app (o changelog interno em versoes.md continua registrando o historico completo,
+# incluindo as versoes v0.x anteriores - so o NUMERO MOSTRADO no app comeca aqui).
+VERSAO_APP = "v1.0"
+
 st.set_page_config(page_title="TIA.go", layout="wide")
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo-enermais.png")
@@ -90,6 +96,31 @@ with st.sidebar:
     if st.button("Sair"):
         st.session_state.clear()
         st.rerun()
+
+    # NOVO (09/09, pedido do Rafael) - numero da versao no rodape (fundo de verdade) da
+    # coluna lateral. Usa flexbox (empurra o texto pro fim do espaco disponivel), NAO
+    # "position:fixed" - essa segunda tecnica ja causou problema visual em outro lugar do
+    # app (chat_input v0.8.0, ver erros-observacoes.md) e foi abandonada por nao ser
+    # confiavel sem teste ao vivo. Flexbox e mais simples e mais previsivel, mas ainda
+    # assim NAO FOI CONFERIDO AO VIVO aqui - se na tela real o numero nao aparecer colado
+    # embaixo (por exemplo se o Streamlit trocar o nome interno do container da barra
+    # lateral numa atualizacao futura), o texto "TIA.go v1.0" continua aparecendo, só que
+    # mais pra cima, junto com o resto - nunca some, so' nao fica no fundo exato.
+    st.markdown(
+        f"""
+        <style>
+        [data-testid="stSidebarUserContent"] {{
+            display: flex;
+            flex-direction: column;
+            min-height: 90vh;
+        }}
+        </style>
+        <div style="margin-top: auto; padding-top: 24px; color: #6b6f85; font-size: 12px;">
+            TIA.go {VERSAO_APP}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 sb = get_supabase()
 
