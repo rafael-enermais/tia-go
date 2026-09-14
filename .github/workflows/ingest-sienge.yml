@@ -1,0 +1,30 @@
+name: Ingestao diaria Sienge -> Supabase (TIA.go)
+
+on:
+  schedule:
+    - cron: '0 7 * * *'   # 07:00 UTC = 04:00 horario de Brasilia
+  workflow_dispatch: {}    # deixa aparecer o botao "Run workflow" pra rodar na mao
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Rodar a ingestao
+        env:
+          SIENGE_BASE_URL: ${{ secrets.SIENGE_BASE_URL }}
+          SIENGE_USER: ${{ secrets.SIENGE_USER }}
+          SIENGE_PASSWORD: ${{ secrets.SIENGE_PASSWORD }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python ingest_sienge_to_supabase.py
