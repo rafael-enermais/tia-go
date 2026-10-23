@@ -1,13 +1,33 @@
+# TIA.go v2.0 - ingestao diaria Sienge -> banco radar-comercial (schema tiago), por conexao direta.
+# Roda todo dia as 04:00 (Brasilia) e sob demanda: Actions > "Ingestao diaria Sienge -> Supabase (TIA.go)" > Run workflow.
+# "simular = true" le o Sienge e so' conta, sem gravar no banco.
+# Secrets (Settings > Secrets and variables > Actions; valor PURO, sem aspas): SIENGE_BASE_URL, SIENGE_USER,
+# SIENGE_PASSWORD, DATABASE_URL (Session pooler, usuario tiago_ingest.<ref>).
+# O repositorio e' publico: o script so' imprime contagens, nunca dado, credencial nem URL.
 name: Ingestao diaria Sienge -> Supabase (TIA.go)
 
 on:
   schedule:
-    - cron: '0 7 * * *'   # 07:00 UTC = 04:00 horario de Brasilia
-  workflow_dispatch: {}    # deixa aparecer o botao "Run workflow" pra rodar na mao
+    - cron: '0 7 * * *'   # 07:00 UTC = 04:00 horario de Brasilia (o GitHub pode atrasar alguns minutos)
+  workflow_dispatch:
+    inputs:
+      simular:
+        description: "true = so' le o Sienge e conta (nao grava no banco)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ingest-sienge-tiago
+  cancel-in-progress: false
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Baixar o repositorio
         uses: actions/checkout@v4
@@ -15,16 +35,22 @@ jobs:
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
-      - name: Instalar dependencias
-        run: pip install -r requirements.txt
+      - name: Instalar dependencias (so' as do ingest)
+        run: pip install -r requirements-ingest.txt
 
       - name: Rodar a ingestao
         env:
           SIENGE_BASE_URL: ${{ secrets.SIENGE_BASE_URL }}
           SIENGE_USER: ${{ secrets.SIENGE_USER }}
           SIENGE_PASSWORD: ${{ secrets.SIENGE_PASSWORD }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python ingest_sienge_to_supabase.py
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PYTHONUNBUFFERED: '1'
+          SIMULAR: ${{ github.event.inputs.simular }}
+        run: |
+          if [ "$SIMULAR" = "true" ]; then
+            python ingest_sienge_tiago.py --simular
+          else
+            python ingest_sienge_tiago.py
+          fi

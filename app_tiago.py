@@ -1,6 +1,8 @@
 """
 TIA.go - App Streamlit: dashboard + chat lado a lado
 
+v2.0: le' dados DIRETO no schema `tiago` do banco radar-comercial (db_tiago.py, papel so'-leitura
+tiago_app); o login continua sendo do Supabase Auth, e so' entra quem estiver ativo em tiago.acesso.
 Le' dados do Supabase (RLS + login) e usa a API da Anthropic com tool use pra
 responder perguntas sobre fluxo de caixa - o modelo so' fala numero que veio
 de verdade das ferramentas (consultar_totais_atuais / consultar_historico_diario).
@@ -8,8 +10,9 @@ de verdade das ferramentas (consultar_totais_atuais / consultar_historico_diario
 Segredos necessarios em Settings > Secrets do Streamlit Cloud (NUNCA no .env
 local, NUNCA no repositorio):
 
-SUPABASE_URL = "https://SEU-PROJETO.supabase.co"
-SUPABASE_ANON_KEY = "sua_anon_key_aqui"   # a publica - NUNCA a service_role aqui
+SUPABASE_URL = "https://SEU-PROJETO.supabase.co"      # projeto radar-comercial (so' o LOGIN usa)
+SUPABASE_ANON_KEY = "sua_anon_key_aqui"   # a publica (publishable) - NUNCA a service_role aqui
+DATABASE_URL = "postgresql://tiago_app.<ref>:<senha>@<host-pooler>:5432/postgres"   # v2.0: leitura DIRETA, Session pooler, papel tiago_app
 ANTHROPIC_API_KEY = "sua_chave_aqui"
 
 TODO: confirmar o nome exato do modelo disponivel na conta antes de rodar em
@@ -22,7 +25,8 @@ import os
 from datetime import date, datetime, timedelta
 
 import streamlit as st
-from supabase import create_client
+from supabase import create_client  # v2.0: so' para o LOGIN (Supabase Auth); os dados vem de db_tiago
+from db_tiago import abrir_dados
 import anthropic
 import pandas as pd
 import plotly.graph_objects as go
@@ -33,7 +37,7 @@ MODEL_ID = "claude-sonnet-4-5"  # TODO confirmar antes de ir pra produção
 # rodape da barra lateral - a partir de agora essa e a versao que aparece pra quem usa
 # o app (o changelog interno em versoes.md continua registrando o historico completo,
 # incluindo as versoes v0.x anteriores - so o NUMERO MOSTRADO no app comeca aqui).
-VERSAO_APP = "v1.0"
+VERSAO_APP = "v2.0"
 
 st.set_page_config(page_title="TIA.go", layout="wide")
 
@@ -62,6 +66,14 @@ def render_logo(height=56):
 # ---------- Cliente Supabase: sempre em session_state, nunca cache_resource ----------
 # (mesma regra do RHdados - cache_resource compartilharia sessão de auth entre
 # usuários diferentes, risco de vazamento de dado financeiro entre [usuária]/Rafael)
+@st.cache_resource
+def get_dados():
+    """Pool de leitura direta (papel tiago_app, so' SELECT). Pode ser compartilhado entre
+    sessoes: ele nao carrega identidade de usuario - quem pode entrar e' decidido no login
+    + tiago.acesso (diferente do cliente do Supabase Auth, que continua por sessao)."""
+    return abrir_dados()
+
+
 def get_supabase():
     if "supabase_client" not in st.session_state:
         st.session_state.supabase_client = create_client(
@@ -80,10 +92,26 @@ def tela_login():
         try:
             sb = get_supabase()
             resp = sb.auth.sign_in_with_password({"email": email, "password": senha})
-            st.session_state.usuario = resp.user.email
-            st.rerun()
         except Exception:
             st.error("E-mail ou senha inválidos")
+            return
+        # v2.0: o login do Supabase e' compartilhado entre os apps do radar-comercial;
+        # so' entra quem estiver liberado (ativo) em tiago.acesso.
+        try:
+            papel = get_dados().email_liberado(resp.user.email)
+        except Exception:
+            st.error("Não consegui conferir a permissão agora. Tente de novo em instantes.")
+            return
+        if not papel:
+            try:
+                sb.auth.sign_out()
+            except Exception:
+                pass
+            st.error("Este e-mail não tem acesso ao TIA.go. Fale com o responsável.")
+            return
+        st.session_state.usuario = resp.user.email
+        st.session_state.papel = papel
+        st.rerun()
 
 
 if "usuario" not in st.session_state:
@@ -122,7 +150,7 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-sb = get_supabase()
+db = get_dados()   # v2.0: dados por conexao direta (antes: sb = cliente da API)
 
 
 # ---------- Ferramentas que o Claude pode chamar (zero alucinação: só dado real) ----------
@@ -161,14 +189,14 @@ def fetch_all(query_builder_fn, page_size=1000):
 
 def consultar_totais_atuais():
     pagar = fetch_all(
-        lambda s, e: sb.table("parcelas_pagar")
+        lambda s, e: db.table("parcelas_pagar")
         .select("balance_amount, authorization_status")
         .gt("balance_amount", 0)
         .order("id")
         .range(s, e)
     )
     receber = fetch_all(
-        lambda s, e: sb.table("parcelas_receber")
+        lambda s, e: db.table("parcelas_receber")
         .select("balance_amount")
         .gt("balance_amount", 0)
         .order("id")
@@ -205,7 +233,7 @@ def consultar_totais_atuais():
 
 def consultar_historico_diario(dias=30):
     resp = (
-        sb.table("resumo_diario_fluxo_caixa")
+        db.table("resumo_diario_fluxo_caixa")
         .select("*")
         .order("capturado_em", desc=True)
         .limit(dias)
@@ -218,7 +246,7 @@ def consultar_maiores_vencimentos(tipo="pagar", n=10):
     n = max(1, min(int(n), 50))
     if tipo == "receber":
         dados = (
-            sb.table("parcelas_receber")
+            db.table("parcelas_receber")
             .select("due_date, client_name, balance_amount")
             .gt("balance_amount", 0)
             .order("balance_amount", desc=True)
@@ -228,7 +256,7 @@ def consultar_maiores_vencimentos(tipo="pagar", n=10):
         )
     else:
         dados = (
-            sb.table("parcelas_pagar")
+            db.table("parcelas_pagar")
             .select("due_date, creditor_name, balance_amount, authorization_status")
             .gt("balance_amount", 0)
             .order("balance_amount", desc=True)
@@ -247,7 +275,7 @@ def consultar_previsao_por_vencimento(meses=3):
     hoje = date.today()
     limite = (hoje + timedelta(days=31 * meses)).isoformat()
     pagar = fetch_all(
-        lambda s, e: sb.table("parcelas_pagar")
+        lambda s, e: db.table("parcelas_pagar")
         .select("due_date, balance_amount, authorization_status")
         .gt("balance_amount", 0)
         .lte("due_date", limite)
@@ -255,7 +283,7 @@ def consultar_previsao_por_vencimento(meses=3):
         .range(s, e)
     )
     receber = fetch_all(
-        lambda s, e: sb.table("parcelas_receber")
+        lambda s, e: db.table("parcelas_receber")
         .select("due_date, balance_amount")
         .gt("balance_amount", 0)
         .lte("due_date", limite)
@@ -314,7 +342,7 @@ def consultar_movimentos(tipo="pagamento", nome=None, meses=3, data=None):
 
     def montar_query(s, e):
         q = (
-            sb.table(tabela)
+            db.table(tabela)
             .select(f"id, bill_id, installment_id, {campo_nome}, payment_date, net_amount, operation_type_name")
             .gte("payment_date", inicio)
             .order("payment_date", desc=True)
@@ -337,7 +365,7 @@ def consultar_aprovacoes(fornecedor=None, dias=90):
     desde_dt = date.today() - timedelta(days=dias)
     def montar_query(s, e):
         q = (
-            sb.table("aprovacoes_pagar")
+            db.table("aprovacoes_pagar")
             .select("id, bill_id, installment_id, creditor_name, authorization_user_name, authorization_date, is_last_to_authorize")
             .gte("authorization_date", desde_dt.isoformat())
             .order("authorization_date", desc=True)
@@ -372,7 +400,7 @@ def consultar_por_unidade_negocio(tipo="pagar", mes=None):
 
     def montar_query(s, e):
         q = (
-            sb.table(tabela)
+            db.table(tabela)
             .select(campos)
             .gt("balance_amount", 0)
             .order("id")
@@ -427,7 +455,7 @@ def consultar_por_empresa(tipo="receber", meses=None):
 
     def montar_query(s, e):
         q = (
-            sb.table(tabela)
+            db.table(tabela)
             .select(campos)
             .gt("balance_amount", 0)
             .order("id")

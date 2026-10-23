@@ -1,121 +1,110 @@
 """
-TIA.go - Ingestao diaria: Sienge (contas a pagar + receber) -> Supabase
+TIA.go - Ingestao diaria Sienge (contas a pagar + receber) -> banco radar-comercial, schema `tiago` | v2.0
 
-Roda 1x por dia (por enquanto manual, ou agendado no Agendador de Tarefas do
-Windows - Fase 0, sem servidor ainda). Grava o estado ATUAL (upsert) em
-parcelas_pagar/parcelas_receber e um SNAPSHOT append-only do dia em
-historico_diario_parcelas(_receber) - e' esse snapshot que da vida ao
-historico do fluxo de caixa (sem ele rodando todo dia, nao existe historico).
+O QUE MUDOU DA v1 (ingest_sienge_to_supabase.py)
+  - Grava por CONEXAO DIRETA no Postgres (Session pooler, porta 5432) com o papel `tiago_ingest`
+    (le/insere/atualiza em tiago.*, sem DELETE), em lotes. Antes gravava pela API do Supabase com a
+    chave de servico e estourava o tempo limite ("statement timeout") em parte das rodadas.
+  - Cada tabela e' gravada numa transacao propria. Se uma falhar, as OUTRAS ainda sao tentadas
+    (antes, a falha em parcelas_pagar impedia o snapshot do dia) e a rodada termina com erro (codigo 1).
+  - Se o Sienge responder 429 (limite de chamadas), espera e tenta de novo (30/60/120/240 s).
+  - As regras de negocio (linha_pagar, linhas_pagamentos, etc.) sao as MESMAS da v1, sem alteracao.
 
-NUNCA COLOQUE CREDENCIAL DIRETO NESTE ARQUIVO. Crie um .env na mesma pasta
-(confirme que esta no .gitignore, NUNCA commitar) assim:
+VARIAVEIS DE AMBIENTE (GitHub: Settings > Secrets and variables > Actions; valor puro, sem aspas)
+  SIENGE_BASE_URL, SIENGE_USER, SIENGE_PASSWORD   (os mesmos de antes)
+  DATABASE_URL   postgresql://tiago_ingest.<ref>:<SENHA>@<host-pooler>:5432/postgres  (Session pooler)
+  Localmente (sem GitHub), as variaveis tambem podem vir de um .env (que fica FORA do git).
 
-SIENGE_BASE_URL=https://api.sienge.com.br/<empresa>/public/api
-SIENGE_USER=usuario_dedicado_tia
-SIENGE_PASSWORD=xxxx
-SUPABASE_URL=https://SEU-PROJETO.supabase.co
-SUPABASE_SERVICE_KEY=xxxx   # service_role - SO' usar aqui, NUNCA no app Streamlit/Secrets
+COMO RODAR
+  Instalar: pip install -r requirements-ingest.txt
+  Rodar:    python ingest_sienge_tiago.py                    (grava hoje)
+            python ingest_sienge_tiago.py --simular          (le o Sienge e conta; NAO grava)
+            python ingest_sienge_tiago.py --data 2026-08-20  (so' teste: etiqueta de data do snapshot)
 
-Instalar:  pip install requests python-dotenv supabase
-Rodar:     python ingest_sienge_to_supabase.py
-
-Pra TESTAR o grafico/selecao de periodo sem esperar dias reais passarem, da
-pra rodar varias vezes com --data simulando dias diferentes (o dado gravado
-e' sempre o estado ATUAL do Sienge, so' a etiqueta de data do snapshot muda -
-ou seja, os valores vao vir IGUAIS em todos os dias simulados, isso e' so'
-pra testar a mecanica do grafico/selecao, nao serve como historico real):
-  python ingest_sienge_to_supabase.py --data 2026-08-20
-  python ingest_sienge_to_supabase.py --data 2026-08-22
-  python ingest_sienge_to_supabase.py            (sem --data = hoje de verdade)
-APAGAR as linhas de teste antes de usar com a [usuária] pra valer:
-  delete from historico_diario_parcelas where capturado_em <> current_date;
-  delete from historico_diario_parcelas_receber where capturado_em <> current_date;
-
-TODO (nao confirmado ainda, revisar antes de rodar contra producao de verdade):
-- 'selectionType': 'D' foi o valor visto em uso real, mas o significado exato
-  nunca foi confirmado com a Sienge/Rafael - se o resultado vier estranho,
-  esse e' o primeiro parametro a questionar.
-- 'correctionDate': confirmado como parametro OBRIGATORIO pelo erro 400 real
-  ("Required String parameter 'correctionDate' is not present"). Como
-  correctionIndexerId='0' (sem indice de correcao), a hipotese e' que o valor
-  da data nao afeta o calculo quando nao ha indice - usamos END (fim da
-  janela) por seguranca, mas isso NAO foi confirmado contra o node de
-  producao do n8n. Se os valores de correctedBalanceAmount vierem diferentes
-  do esperado, e' aqui que se deve olhar primeiro.
-- Paginacao: nao testamos volume grande o suficiente pra saber se o Sienge
-  corta silenciosamente (a API Bulk Data tem modo assincrono por chunk pra
-  volumes grandes - nao implementado aqui ainda, MVP assume que cabe numa
-  chamada so, como aconteceu nos testes de hoje).
-- IDs de movimentos_pagamento/movimentos_recebimento usam o INDICE da lista
-  payments[]/receipts[] (nao o sequencialNumber do Sienge - confirmado com
-  dado real que ele repete dentro da mesma parcela). Isso assume que o Sienge
-  devolve os eventos na MESMA ORDEM em toda chamada - nao confirmado
-  formalmente, e' a premissa mais simples que funciona hoje. Se algum dia um
-  pagamento antigo sumir/duplicar depois de rodar de novo, e' aqui que se
-  deve olhar.
+O repositorio e' PUBLICO: este script so' imprime contagens, nunca dado, credencial nem URL.
+As anotacoes TODO sobre parametros do Sienge (selectionType, correctionDate, paginacao, ids por indice)
+continuam valendo e estao no cabecalho de ingest_sienge_to_supabase.py (v1, mantido para consulta).
 """
+from __future__ import annotations
 
 import argparse
 import os
+import sys
+import time
 from datetime import date, timedelta
+from urllib.parse import urlparse, unquote
 
 import requests
 from requests.auth import HTTPBasicAuth
-from dotenv import load_dotenv
-from supabase import create_client
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:  # python-dotenv e' opcional (no GitHub as variaveis ja vem prontas)
+    pass
+
+PAPEL_INGEST = "tiago_ingest"
+SCHEMA = "tiago"
+ESPERAS_429 = (30, 60, 120, 240)
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument(
-        "--data",
-        help=(
-            "Data (YYYY-MM-DD) pra gravar como 'capturado_em' do snapshot, no lugar de "
-            "hoje. SÓ pra teste/backfill do gráfico (o dado ainda é o estado ATUAL do "
-            "Sienge, só a etiqueta de data do snapshot muda) - apaga essas linhas de "
-            "teste antes de usar com a [usuária] pra valer, senão mistura histórico fake "
-            "com real."
-        ),
-    )
-    return p.parse_args()
+    p.add_argument("--data", help="YYYY-MM-DD: etiqueta de data do snapshot (SO' teste/backfill).")
+    p.add_argument("--simular", action="store_true", help="le o Sienge e conta, mas NAO grava no banco")
+    return p.parse_args(argv)
 
 
-_args = parse_args()
-
-SIENGE_BASE = os.environ["SIENGE_BASE_URL"].rstrip("/")
-SIENGE_AUTH = HTTPBasicAuth(os.environ["SIENGE_USER"], os.environ["SIENGE_PASSWORD"])
-supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
-
-HOJE = date.today()
-CAPTURADO_EM = _args.data or HOJE.isoformat()
-if _args.data:
-    print(f"AVISO: rodando em modo backfill de teste - snapshot vai ser gravado como {CAPTURADO_EM} (hoje real: {HOJE.isoformat()}).")
-START = (HOJE - timedelta(days=30)).isoformat()
-END = (HOJE + timedelta(days=90)).isoformat()
+def env_obrigatoria(nome: str) -> str:
+    v = (os.environ.get(nome) or "").strip()
+    if not v:
+        print(f"ERRO de configuracao: falta a variavel {nome}.")
+        sys.exit(2)
+    return v
 
 
-def buscar_sienge(recurso, params_extra):
-    url = f"{SIENGE_BASE}/bulk-data/v1/{recurso}"
+# ---- Sienge (somente leitura) ----
+class Janela:
+    def __init__(self, hoje: date, captura: str | None = None):
+        self.hoje = hoje
+        self.start = (hoje - timedelta(days=30)).isoformat()
+        self.end = (hoje + timedelta(days=90)).isoformat()
+        self.capturado_em = captura or hoje.isoformat()
+
+
+def buscar_sienge(base, auth, janela: Janela, recurso, params_extra, esperas=ESPERAS_429, dormir=time.sleep, get=requests.get):
+    url = f"{base}/bulk-data/v1/{recurso}"
     params = {
-        "startDate": START,
-        "endDate": END,
-        "selectionType": "D",  # TODO: confirmar significado exato
+        "startDate": janela.start,
+        "endDate": janela.end,
+        "selectionType": "D",  # TODO: confirmar significado exato (ver v1)
         "correctionIndexerId": "0",
-        "correctionDate": END,  # TODO: valor assumido (sem indice=0 -> data nao deveria importar), nao confirmado com o node de producao
+        "correctionDate": janela.end,
         **params_extra,
     }
-    r = requests.get(url, params=params, auth=SIENGE_AUTH, timeout=60)
-    if not r.ok:
-        # Sienge devolve um corpo com "clientMessage" explicando o motivo exato
-        # do 400 - sem isso o raise_for_status() so mostra o codigo, nao a causa.
-        print(f"  ERRO {r.status_code} em '{recurso}' - corpo da resposta:")
-        print(f"  {r.text}")
-    r.raise_for_status()
-    data = r.json()
-    return data.get("data", data) if isinstance(data, dict) else data
+    tentativa = 0
+    while True:
+        r = get(url, params=params, auth=auth, timeout=60)
+        if r.status_code == 429 and tentativa < len(esperas):
+            print(f"  Sienge pediu para esperar (429) em '{recurso}'; aguardando {esperas[tentativa]} s...")
+            dormir(esperas[tentativa])
+            tentativa += 1
+            continue
+        if not r.ok:
+            # Sem imprimir o corpo (repositorio publico): so' o codigo e o recurso.
+            print(f"  ERRO {r.status_code} em '{recurso}'.")
+            r.raise_for_status()
+        data = r.json()
+        return data.get("data", data) if isinstance(data, dict) else data
 
+
+# ---- Regras de negocio: IDENTICAS a v1 (nao alterar sem teste) ----
 
 def linha_pagar(p):
     return {
@@ -328,68 +317,189 @@ def linhas_aprovacoes(p):
     return linhas
 
 
-def main():
-    print(f"Janela de datas: {START} a {END}")
+# ---- Gravacao direta no Postgres ----
+CHAVE_CONFLITO = {
+    "parcelas_pagar": ("id",),
+    "parcelas_receber": ("id",),
+    "movimentos_pagamento": ("id",),
+    "movimentos_recebimento": ("id",),
+    "aprovacoes_pagar": ("id",),
+    "historico_diario_parcelas": ("bill_id", "installment_id", "capturado_em"),
+    "historico_diario_parcelas_receber": ("bill_id", "installment_id", "capturado_em"),
+}
+TAMANHO_LOTE = 500
 
-    print("Buscando contas a pagar (outcome)...")
-    pagar_raw = buscar_sienge("outcome", {"withBankMovements": "true", "withAuthorizations": "true"})
-    print(f"  {len(pagar_raw)} parcelas recebidas")
-    if pagar_raw:
-        pagar_rows = [linha_pagar(p) for p in pagar_raw]
-        supabase.table("parcelas_pagar").upsert(pagar_rows, on_conflict="id").execute()
-        print("  upsert em parcelas_pagar OK")
 
-        hist_pagar = [{
-            "capturado_em": CAPTURADO_EM,
+def validar_url(url: str) -> None:
+    u = urlparse(url)
+    if u.scheme not in ("postgresql", "postgres"):
+        raise ValueError("DATABASE_URL precisa comecar com postgresql://")
+    if unquote(u.username or "").split(".")[0] != PAPEL_INGEST:
+        raise ValueError(f"a DATABASE_URL precisa entrar como {PAPEL_INGEST} (usuario {PAPEL_INGEST}.<ref> no pooler)")
+    if u.port == 6543:
+        raise ValueError("use o Session pooler (porta 5432), nao o Transaction pooler (6543)")
+
+
+def conectar(url: str):
+    import psycopg2
+
+    validar_url(url)
+    conn = psycopg2.connect(url, connect_timeout=30, application_name="tiago_ingest")
+    with conn.cursor() as cur:
+        cur.execute(f"SET search_path TO {SCHEMA}")  # o pooler nao carrega 'alter role ... set search_path'
+        cur.execute("SET TIME ZONE 'UTC'")
+        cur.execute("SET statement_timeout = '120s'")
+        cur.execute("SELECT current_user")
+        usuario = cur.fetchone()[0]
+    conn.commit()  # os SET precisam ser confirmados
+    if usuario != PAPEL_INGEST:
+        conn.close()
+        raise ValueError(f"conectou como {usuario!r}; so' {PAPEL_INGEST} e' permitido")
+    return conn
+
+
+def _valor(v):
+    from psycopg2.extras import Json
+
+    return Json(v) if isinstance(v, (dict, list)) else v
+
+
+def upsert(conn, tabela: str, linhas: list) -> int:
+    """INSERT ... ON CONFLICT DO UPDATE em lotes, numa unica transacao. Devolve quantas linhas enviou.
+    Mesmo efeito do upsert da API: colunas do envio sao atualizadas; as demais ficam como estao."""
+    from psycopg2 import sql
+    from psycopg2.extras import execute_values
+
+    if not linhas:
+        return 0
+    chave = CHAVE_CONFLITO[tabela]
+    colunas = list(linhas[0].keys())
+    # remove chave repetida dentro do mesmo envio (o banco recusa 'afetar a mesma linha 2x')
+    unicas = {}
+    for r in linhas:
+        unicas[tuple(r[c] for c in chave)] = r
+    linhas = list(unicas.values())
+    atualizar = [c for c in colunas if c not in chave]
+    if atualizar:
+        sets = sql.SQL(", ").join(sql.SQL("{c} = EXCLUDED.{c}").format(c=sql.Identifier(c)) for c in atualizar)
+        acao = sql.SQL("DO UPDATE SET ") + sets
+    else:
+        acao = sql.SQL("DO NOTHING")
+    comando = sql.SQL("INSERT INTO {t} ({cols}) VALUES %s ON CONFLICT ({k}) ").format(
+        t=sql.Identifier(SCHEMA, tabela),
+        cols=sql.SQL(", ").join(sql.Identifier(c) for c in colunas),
+        k=sql.SQL(", ").join(sql.Identifier(c) for c in chave),
+    ) + acao
+    try:
+        with conn.cursor() as cur:
+            for i in range(0, len(linhas), TAMANHO_LOTE):
+                lote = linhas[i : i + TAMANHO_LOTE]
+                execute_values(cur, comando.as_string(conn), [tuple(_valor(r[c]) for c in colunas) for r in lote], page_size=TAMANHO_LOTE)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return len(linhas)
+
+
+def montar_historico_pagar(raw, capturado_em):
+    return [
+        {
+            "capturado_em": capturado_em,
             "bill_id": p["billId"],
             "installment_id": p["installmentId"],
             "due_date": p["dueDate"],
             "balance_amount": p["balanceAmount"],
             "authorization_status": p["authorizationStatus"],
-        } for p in pagar_raw]
-        supabase.table("historico_diario_parcelas").upsert(
-            hist_pagar, on_conflict="bill_id,installment_id,capturado_em"
-        ).execute()
-        print("  snapshot em historico_diario_parcelas OK")
+        }
+        for p in raw
+    ]
 
-        mov_pagamento_rows = [linha for p in pagar_raw for linha in linhas_pagamentos(p)]
-        if mov_pagamento_rows:
-            supabase.table("movimentos_pagamento").upsert(mov_pagamento_rows, on_conflict="id").execute()
-            print(f"  upsert em movimentos_pagamento OK ({len(mov_pagamento_rows)} pagamentos reais)")
 
-        aprov_rows = [linha for p in pagar_raw for linha in linhas_aprovacoes(p)]
-        if aprov_rows:
-            supabase.table("aprovacoes_pagar").upsert(aprov_rows, on_conflict="id").execute()
-            print(f"  upsert em aprovacoes_pagar OK ({len(aprov_rows)} aprovações)")
-
-    print("Buscando contas a receber (income)...")
-    receber_raw = buscar_sienge("income", {"withBankMovements": "true"})
-    print(f"  {len(receber_raw)} parcelas recebidas")
-    if receber_raw:
-        receber_rows = [linha_receber(p) for p in receber_raw]
-        supabase.table("parcelas_receber").upsert(receber_rows, on_conflict="id").execute()
-        print("  upsert em parcelas_receber OK")
-
-        hist_receber = [{
-            "capturado_em": CAPTURADO_EM,
+def montar_historico_receber(raw, capturado_em):
+    return [
+        {
+            "capturado_em": capturado_em,
             "bill_id": p["billId"],
             "installment_id": p["installmentId"],
             "due_date": p["dueDate"],
             "balance_amount": p["balanceAmount"],
             "defaulter_situation": p.get("defaulterSituation"),
-        } for p in receber_raw]
-        supabase.table("historico_diario_parcelas_receber").upsert(
-            hist_receber, on_conflict="bill_id,installment_id,capturado_em"
-        ).execute()
-        print("  snapshot em historico_diario_parcelas_receber OK")
+        }
+        for p in raw
+    ]
 
-        mov_recebimento_rows = [linha for p in receber_raw for linha in linhas_recebimentos(p)]
-        if mov_recebimento_rows:
-            supabase.table("movimentos_recebimento").upsert(mov_recebimento_rows, on_conflict="id").execute()
-            print(f"  upsert em movimentos_recebimento OK ({len(mov_recebimento_rows)} recebimentos reais)")
 
-    print("Ingestão concluída.")
+def gravar_tabelas(conn, plano, log=print) -> int:
+    """plano = lista de (tabela, linhas). Cada tabela numa transacao; falha de uma nao impede as outras.
+    Devolve quantas tabelas falharam."""
+    falhas = 0
+    for tabela, linhas in plano:
+        try:
+            n = upsert(conn, tabela, linhas)
+            log(f"  {tabela}: {n} linhas gravadas")
+        except Exception as e:
+            falhas += 1
+            # so' o tipo do erro e o codigo (repositorio publico)
+            log(f"  ERRO ao gravar {tabela}: {type(e).__name__} {getattr(e, 'pgcode', '') or ''}")
+    return falhas
+
+
+def montar_plano(pagar_raw, receber_raw, capturado_em):
+    plano = []
+    if pagar_raw:
+        plano += [
+            ("parcelas_pagar", [linha_pagar(p) for p in pagar_raw]),
+            ("historico_diario_parcelas", montar_historico_pagar(pagar_raw, capturado_em)),
+            ("movimentos_pagamento", [l for p in pagar_raw for l in linhas_pagamentos(p)]),
+            ("aprovacoes_pagar", [l for p in pagar_raw for l in linhas_aprovacoes(p)]),
+        ]
+    if receber_raw:
+        plano += [
+            ("parcelas_receber", [linha_receber(p) for p in receber_raw]),
+            ("historico_diario_parcelas_receber", montar_historico_receber(receber_raw, capturado_em)),
+            ("movimentos_recebimento", [l for p in receber_raw for l in linhas_recebimentos(p)]),
+        ]
+    return plano
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    hoje = date.today()
+    janela = Janela(hoje, args.data)
+    if args.data:
+        print(f"AVISO: modo backfill de teste - snapshot gravado como {janela.capturado_em} (hoje real: {hoje.isoformat()}).")
+
+    base = env_obrigatoria("SIENGE_BASE_URL").rstrip("/")
+    auth = HTTPBasicAuth(env_obrigatoria("SIENGE_USER"), env_obrigatoria("SIENGE_PASSWORD"))
+    url = "" if args.simular else env_obrigatoria("DATABASE_URL")
+
+    print(f"Janela de datas: {janela.start} a {janela.end}")
+    print("Buscando contas a pagar (outcome)...")
+    pagar_raw = buscar_sienge(base, auth, janela, "outcome", {"withBankMovements": "true", "withAuthorizations": "true"})
+    print(f"  {len(pagar_raw)} parcelas recebidas")
+    print("Buscando contas a receber (income)...")
+    receber_raw = buscar_sienge(base, auth, janela, "income", {"withBankMovements": "true"})
+    print(f"  {len(receber_raw)} parcelas recebidas")
+
+    plano = montar_plano(pagar_raw, receber_raw, janela.capturado_em)
+    if args.simular:
+        print("SIMULACAO (nada foi gravado):")
+        for tabela, linhas in plano:
+            print(f"  {tabela}: {len(linhas)} linhas seriam enviadas")
+        return 0
+
+    conn = conectar(url)
+    try:
+        falhas = gravar_tabelas(conn, plano)
+    finally:
+        conn.close()
+    if falhas:
+        print(f"Ingestao terminou COM ERRO em {falhas} tabela(s).")
+        return 1
+    print("Ingestao concluida.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
