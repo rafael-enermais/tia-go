@@ -97,9 +97,21 @@ def tela_login():
             return
         # v2.0: o login do Supabase e' compartilhado entre os apps do radar-comercial;
         # so' entra quem estiver liberado (ativo) em tiago.acesso.
-        try:
-            papel = get_dados().email_liberado(resp.user.email)
-        except Exception:
+        papel = None
+        falhou = False
+        for tentativa in (1, 2):
+            try:
+                papel = get_dados().email_liberado(resp.user.email)
+                falhou = False
+                break
+            except Exception as e:
+                falhou = True
+                # log privado do Streamlit (sem senha): so' o tipo do erro e a 1a linha da mensagem
+                print(f"[tiago] conferir permissao falhou (tentativa {tentativa}): "
+                      f"{type(e).__name__} {getattr(e, 'pgcode', '') or ''} "
+                      f"{(str(e).splitlines() or [''])[0][:200]}", flush=True)
+                get_dados.clear()  # descarta o pool em cache (conexoes velhas) e tenta de novo
+        if falhou:
             st.error("Não consegui conferir a permissão agora. Tente de novo em instantes.")
             return
         if not papel:
