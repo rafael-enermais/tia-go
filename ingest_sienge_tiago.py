@@ -463,6 +463,21 @@ def montar_plano(pagar_raw, receber_raw, capturado_em):
     return plano
 
 
+def registrar_metricas(conn) -> None:
+    """Calcula e registra os KPIs (tiago.registrar_metricas). Tolerante: se a rotina ainda nao existe
+    ou falhar, avisa no log mas NAO derruba a ingestao (os dados ja foram gravados)."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {SCHEMA}.registrar_metricas()")
+            n = cur.fetchone()[0]
+        conn.commit()
+        print(f"Metricas registradas: {n}")
+    except Exception as e:
+        conn.rollback()
+        # so' o tipo do erro e o codigo (repositorio publico)
+        print(f"AVISO: metricas nao registradas ({type(e).__name__} {getattr(e, 'pgcode', '') or ''}); os dados foram gravados.")
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     hoje = date.today()
@@ -492,6 +507,8 @@ def main(argv=None) -> int:
     conn = conectar(url)
     try:
         falhas = gravar_tabelas(conn, plano)
+        if not falhas:
+            registrar_metricas(conn)
     finally:
         conn.close()
     if falhas:

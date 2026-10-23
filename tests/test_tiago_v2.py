@@ -342,3 +342,35 @@ def test_pool_reaproveita_e_limita_conexoes(banco):
     pool.putconn(b)
     pool.putconn(c)
     pool.fechar_tudo()
+
+
+# ---- v2.1: registro de metricas apos a ingestao (sem banco: conexao de mentira) ----
+class _CurFalso:
+    def __init__(self, conn): self.conn = conn
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def execute(self, q):
+        self.conn.comandos.append(q)
+        if self.conn.erro: raise self.conn.erro
+    def fetchone(self): return (6,)
+
+
+class _ConnFalsa:
+    def __init__(self, erro=None): self.comandos, self.erro, self.commits, self.rollbacks = [], erro, 0, 0
+    def cursor(self): return _CurFalso(self)
+    def commit(self): self.commits += 1
+    def rollback(self): self.rollbacks += 1
+
+
+def test_registrar_metricas_chama_rotina_e_confirma(capsys):
+    c = _ConnFalsa()
+    I.registrar_metricas(c)
+    assert c.comandos == ["SELECT tiago.registrar_metricas()"] and c.commits == 1
+    assert "Metricas registradas: 6" in capsys.readouterr().out
+
+
+def test_registrar_metricas_tolerante_a_falha(capsys):
+    c = _ConnFalsa(erro=RuntimeError("segredo-nao-deve-aparecer"))
+    I.registrar_metricas(c)  # nao levanta
+    saida = capsys.readouterr().out
+    assert c.rollbacks == 1 and "AVISO" in saida and "segredo" not in saida
